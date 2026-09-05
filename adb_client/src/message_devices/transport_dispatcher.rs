@@ -224,8 +224,11 @@ fn run_loop<T: ADBMessageTransport>(
                     // the Android localabstract endpoint used to register it.
                     let destination = String::from_utf8_lossy(packet.payload());
                     let destination = destination.trim_end_matches('\0');
-                    if routes.values().any(|local| local == destination) {
-                        if let Some(port) = destination.strip_prefix("tcp:").and_then(|s| s.parse::<u16>().ok()) {
+                    // For reverse forwarding, adbd opens the configured
+                    // remote endpoint (the map key); the map value is the
+                    // host TCP listener to which that connection is relayed.
+                    if let Some(local) = routes.get(destination) {
+                        if let Some(port) = local.strip_prefix("tcp:").and_then(|s| s.parse::<u16>().ok()) {
                             let local_id = (1..u32::MAX).find(|id| !sessions.contains_key(id)).unwrap();
                             let (tx, rx) = mpsc::channel();
                             sessions.insert(local_id, tx);
