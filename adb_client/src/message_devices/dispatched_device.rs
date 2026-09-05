@@ -82,7 +82,8 @@ impl DispatchedADBMessageDevice {
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         self.forwards.lock().unwrap().insert(local.clone(), (remote.clone(), Arc::clone(&stop)));
-        for incoming in listener.incoming() {
+        std::thread::scope(|scope| -> Result<()> {
+          for incoming in listener.incoming() {
             if stop.load(Ordering::Acquire) { break; }
             let socket = match incoming {
                 Ok(socket) => socket,
@@ -92,10 +93,16 @@ impl DispatchedADBMessageDevice {
                 }
                 Err(error) => return Err(error.into()),
             };
-            if let Err(error) = self.forward_connection(socket, &remote) {
-                log::debug!("ADB forward connection ended: {error}");
-            }
-        }
+            let device = self;
+            let destination = remote.clone();
+            scope.spawn(move || {
+                if let Err(error) = device.forward_connection(socket, &destination) {
+                    log::debug!("ADB forward connection ended: {error}");
+                }
+            });
+          }
+          Ok(())
+        })?;
         self.forwards.lock().unwrap().remove(&local);
         Ok(())
     }
