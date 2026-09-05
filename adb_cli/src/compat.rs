@@ -145,6 +145,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             };
             direct_daemon::stream_request(&context, &format!("SHELL\t{command}"))?;
         }
+        Some("stat") | Some("stat2") if args.len() == 2 => {
+            let path = args[1].replace('\'', "'\\''");
+            // Keep the output textual and stable for file-management callers:
+            // name, byte size, octal mode, and modification time.
+            direct_daemon::stream_request(
+                &context,
+                &format!("SHELL\tstat -c '%n %s %a %Y' -- '{path}'"),
+            )?;
+        }
         Some("shell") | Some("exec-out") => {
             let kind = if args[0] == "shell" { "SHELL" } else { "EXEC" };
             // Accept the common PTY switches. The direct transport always uses
