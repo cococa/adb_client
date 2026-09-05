@@ -220,6 +220,7 @@ impl DispatchedADBMessageDevice {
     }
 
     pub(crate) fn reverse_forward(&self, remote: String, local: String) -> Result<()> {
+        eprintln!("[adb_client] installing reverse remote={remote} local={local}");
         let port = local.strip_prefix("tcp:").and_then(|value| value.parse::<u16>().ok())
             .filter(|port| *port != 0).ok_or_else(|| RustADBError::ADBRequestFailed("reverse requires tcp:<port>".into()))?;
         self.dispatcher.set_route(remote.clone(), Some(format!("tcp:{port}")))?;

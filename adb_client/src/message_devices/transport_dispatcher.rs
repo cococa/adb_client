@@ -224,6 +224,7 @@ fn run_loop<T: ADBMessageTransport>(
                     // the Android localabstract endpoint used to register it.
                     let destination = String::from_utf8_lossy(packet.payload());
                     let destination = destination.trim_end_matches('\0');
+                    eprintln!("[adb_client] device OPEN destination={destination} routes={:?}", routes);
                     // For reverse forwarding, adbd opens the configured
                     // remote endpoint (the map key); the map value is the
                     // host TCP listener to which that connection is relayed.
