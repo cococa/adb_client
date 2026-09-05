@@ -228,7 +228,10 @@ fn run_loop<T: ADBMessageTransport>(
                     // For reverse forwarding, adbd opens the configured
                     // remote endpoint (the map key); the map value is the
                     // host TCP listener to which that connection is relayed.
-                    if let Some(local) = routes.get(destination) {
+                    let local = routes.get(destination).or_else(|| {
+                        routes.values().find(|candidate| candidate.as_str() == destination)
+                    });
+                    if let Some(local) = local {
                         if let Some(port) = local.strip_prefix("tcp:").and_then(|s| s.parse::<u16>().ok()) {
                             let local_id = (1..u32::MAX).find(|id| !sessions.contains_key(id)).unwrap();
                             let (tx, rx) = mpsc::channel();
