@@ -236,6 +236,7 @@ fn run_loop<T: ADBMessageTransport>(
                             let remote_id = packet.header().arg0();
                             thread::spawn(move || {
                                 if let Err(error) = relay(session, remote_id, port) {
+                                    eprintln!("[adb_client] reverse relay failed for tcp:{port}: {error}");
                                     log::debug!("reverse relay closed: {error}");
                                 }
                             });
