@@ -294,13 +294,23 @@ fn handle(
             let local = fields.next().ok_or("missing local forward endpoint")?.to_owned();
             let remote = fields.next().ok_or("missing remote forward endpoint")?.to_owned();
             let device = Arc::clone(&device);
-            stream.write_all(b"OK\n")?;
+            let local_key = local.clone();
+            let listener_device = Arc::clone(&device);
             std::thread::spawn(move || {
-                if let Err(error) = device.serve_forward(local, remote) {
+                if let Err(error) = listener_device.serve_forward(local, remote) {
                     log::debug!("ADB forward listener ended: {error}");
                 }
             });
-            return Ok(());
+            // Do not acknowledge until the listener has completed bind; scrcpy
+            // connects immediately after adb forward returns.
+            for _ in 0..100 {
+                if device.forward_routes().iter().any(|(endpoint, _)| endpoint == &local_key) {
+                    stream.write_all(b"OK\n")?;
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return Err("forward listener did not become ready".into());
         }
         "FORWARD_LIST" => {
             for (local, remote) in device.forward_routes() {
