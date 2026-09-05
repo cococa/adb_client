@@ -2,6 +2,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod adb_termios;
+mod compat;
+mod direct_daemon;
 
 mod handlers;
 mod models;
@@ -80,6 +82,18 @@ fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> AD
             device.push(&mut input, &path)?;
             log::info!("Uploaded {filename} to {path}");
         }
+        DeviceCommands::Reverse { remote, local } => {
+            device.reverse_forward(remote, local)?;
+            log::info!("Installed direct USB reverse rule");
+        }
+        DeviceCommands::ReverseRelay { remote, local } => {
+            log::info!("Serving direct USB reverse relay");
+            device.run_reverse_relay(remote, local)?;
+        }
+        DeviceCommands::ReverseRemove { remote } => {
+            device.remove_reverse_forward(remote)?;
+            log::info!("Removed direct USB reverse rule");
+        }
         DeviceCommands::Root => {
             device.root()?;
             log::info!("Restarted adbd as root");
@@ -112,6 +126,28 @@ fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> AD
 }
 
 fn main() -> ExitCode {
+    if std::env::var_os("ADB_CLI_DIRECT_DAEMON").is_some() {
+        return match direct_daemon::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("adb_cli direct daemon: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if (std::env::var_os("MACANDROIDBRIDGE_ADB_KEY").is_some()
+        && std::env::args().nth(1).as_deref() == Some("usb")
+        && !std::env::args().any(|arg| arg == "--list")) || std::env::args_os()
+        .next()
+        .and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name == "adb")
+        })
+        .unwrap_or(false)
+    {
+        return compat::run();
+    }
     if let Err(err) = inner_main() {
         log::error!("{err}");
         return ExitCode::FAILURE;
@@ -168,6 +204,7 @@ fn inner_main() -> ADBCliResult<()> {
                         vendor_id,
                         product_id,
                         device_description,
+                        ..
                     },
                 ) in devices.iter().enumerate()
                 {

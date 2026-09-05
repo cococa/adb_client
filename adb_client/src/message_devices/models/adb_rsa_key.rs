@@ -3,10 +3,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use num_bigint::{BigUint, ModInverse};
 use num_traits::FromPrimitive;
 use num_traits::cast::ToPrimitive;
-use rsa::pkcs8::DecodePrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey};
-use std::fs::read_to_string;
+use std::fs::{OpenOptions, create_dir_all, read_to_string};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const ADB_PRIVATE_KEY_SIZE: usize = 2048;
@@ -61,6 +63,24 @@ impl ADBRsaKey {
         Ok(Self {
             private_key: RsaPrivateKey::from_pkcs8_pem(pkcs8_content)?,
         })
+    }
+
+    /// Stores this key as a PKCS#8 PEM file for reuse across ADB sessions.
+    pub fn write_pkcs8<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)?;
+        }
+
+        let pem = self.private_key.to_pkcs8_pem(LineEnding::LF)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        use std::io::Write;
+        let mut file = options.open(path)?;
+        file.write_all(pem.as_bytes())?;
+        Ok(())
     }
 
     pub fn android_pubkey_encode(&self) -> Result<String> {

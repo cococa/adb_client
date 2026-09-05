@@ -1,10 +1,11 @@
-use std::{sync::Arc, time::Duration};
-
-use rusb::{
-    Context, Device, DeviceHandle, Direction, TransferType, UsbContext,
-    constants::LIBUSB_CLASS_VENDOR_SPEC,
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
+use nusb::{DeviceInfo, MaybeFuture};
+
+use super::utils::is_adb_device;
 use crate::{
     Result, RustADBError,
     adb_transport::ADBTransport,
@@ -15,209 +16,241 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug)]
-struct Endpoint {
-    iface: u8,
-    address: u8,
-    max_packet_size: usize,
+// nusb discovers USB devices reliably on macOS. Its device-level IOKit open
+// fails for some Android composite devices, whereas AOSP adb opens ff:42:01
+// directly. The native bridge follows that public IOKit interface strategy.
+#[cfg(target_os = "macos")]
+mod macos_iokit {
+    use std::ffi::c_void;
+    #[repr(C)]
+    pub struct Handle {
+        _private: [u8; 0],
+    }
+    unsafe extern "C" {
+        pub fn macadb_open(vendor_id: u16, product_id: u16, output: *mut *mut Handle) -> i32;
+        pub fn macadb_read(
+            handle: *mut Handle,
+            buffer: *mut c_void,
+            length: *mut u32,
+            timeout_ms: u32,
+        ) -> i32;
+        pub fn macadb_write(
+            handle: *mut Handle,
+            buffer: *const c_void,
+            length: u32,
+            timeout_ms: u32,
+        ) -> i32;
+        pub fn macadb_max_packet_size(handle: *const Handle) -> u16;
+        pub fn macadb_close(handle: *mut Handle);
+    }
 }
 
-/// Transport running on USB
-#[derive(Debug, Clone)]
+#[cfg(target_os = "macos")]
+struct MacOSConnection {
+    handle: *mut macos_iokit::Handle,
+}
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacOSConnection {}
+#[cfg(target_os = "macos")]
+impl Drop for MacOSConnection {
+    fn drop(&mut self) {
+        unsafe { macos_iokit::macadb_close(self.handle) };
+    }
+}
+
+/// Direct USB transport. Device discovery is nusb; macOS transfer is through
+/// AOSP-compatible, interface-level IOKit calls.
 pub struct USBTransport {
-    device: Device<Context>,
-    handle: Option<Arc<DeviceHandle<Context>>>,
-    read_endpoint: Option<Endpoint>,
-    write_endpoint: Option<Endpoint>,
+    vendor_id: u16,
+    product_id: u16,
+    #[cfg(target_os = "macos")]
+    connection: Option<Arc<Mutex<MacOSConnection>>>,
+}
+
+impl Clone for USBTransport {
+    fn clone(&self) -> Self {
+        Self {
+            vendor_id: self.vendor_id,
+            product_id: self.product_id,
+            #[cfg(target_os = "macos")]
+            connection: self.connection.clone(),
+        }
+    }
+}
+impl std::fmt::Debug for USBTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("USBTransport")
+            .field("vendor_id", &format_args!("{:04x}", self.vendor_id))
+            .field("product_id", &format_args!("{:04x}", self.product_id))
+            .field("connected", &self.is_connected())
+            .finish()
+    }
 }
 
 impl USBTransport {
-    /// Instantiate a new [`USBTransport`].
-    /// Only the first device with given `vendor_id` and `product_id` is returned.
+    /// Creates a transport for a discovered ADB USB device.
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
-        let context = Context::new()?;
-        for device in context.devices()?.iter() {
-            if let Ok(descriptor) = device.device_descriptor()
-                && descriptor.vendor_id() == vendor_id
-                && descriptor.product_id() == product_id
-            {
-                return Ok(Self::new_from_device(device));
-            }
-        }
-
-        Err(RustADBError::DeviceNotFound(format!(
-            "cannot find USB device with vendor_id={vendor_id} and product_id={product_id}",
-        )))
+        let device_info = nusb::list_devices()
+            .wait()?
+            .find(|device| {
+                device.vendor_id() == vendor_id
+                    && device.product_id() == product_id
+                    && is_adb_device(device)
+            })
+            .ok_or(RustADBError::USBDeviceNotFound(vendor_id, product_id))?;
+        Self::new_from_device(device_info)
     }
-
-    /// Instantiate a new [`USBTransport`] from a [`rusb::Device`].
-    ///
-    /// Devices can be enumerated using [`rusb::Context::devices()`] and then filtered out to get desired device.
-    #[must_use]
-    pub const fn new_from_device(rusb_device: rusb::Device<Context>) -> Self {
-        Self {
-            device: rusb_device,
-            handle: None,
-            read_endpoint: None,
-            write_endpoint: None,
+    /// Creates a transport from a device returned by USB discovery.
+    pub fn new_from_device(device_info: DeviceInfo) -> Result<Self> {
+        if !is_adb_device(&device_info) {
+            return Err(RustADBError::USBNoDescriptorFound);
         }
+        Ok(Self {
+            vendor_id: device_info.vendor_id(),
+            product_id: device_info.product_id(),
+            #[cfg(target_os = "macos")]
+            connection: None,
+        })
     }
-
     pub(crate) fn vendor_id(&self) -> Result<u16> {
-        Ok(self.device.device_descriptor().map(|d| d.vendor_id())?)
+        Ok(self.vendor_id)
     }
-
     pub(crate) fn product_id(&self) -> Result<u16> {
-        Ok(self.device.device_descriptor().map(|d| d.product_id())?)
+        Ok(self.product_id)
     }
 
-    pub(crate) fn get_raw_connection(&self) -> Result<Arc<DeviceHandle<Context>>> {
-        self.handle
+    #[cfg(target_os = "macos")]
+    fn connection(&self) -> Result<std::sync::MutexGuard<'_, MacOSConnection>> {
+        self.connection
             .as_ref()
-            .ok_or(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "not connected",
-            )))
-            .cloned()
+            .ok_or_else(|| {
+                RustADBError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "ADB USB interface is not open",
+                ))
+            })?
+            .lock()
+            .map_err(Into::into)
     }
-
-    fn get_read_endpoint(&self) -> Result<Endpoint> {
-        self.read_endpoint
-            .as_ref()
-            .ok_or(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no read endpoint setup",
-            )))
-            .cloned()
-    }
-
-    fn get_write_endpoint(&self) -> Result<&Endpoint> {
-        self.write_endpoint
-            .as_ref()
-            .ok_or(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no write endpoint setup",
-            )))
-    }
-
-    fn configure_endpoint(handle: &DeviceHandle<Context>, endpoint: &Endpoint) -> Result<()> {
-        match handle.claim_interface(endpoint.iface) {
-            Ok(()) => Ok(()),
-            // busy state likely indicates an ADB server is running and has taken the lock over the device
-            Err(rusb::Error::Busy) => Err(RustADBError::DeviceBusy),
-            Err(err) => Err(err.into()),
+    #[cfg(target_os = "macos")]
+    fn timeout_ms(timeout: Duration) -> u32 {
+        if timeout == Duration::MAX {
+            0
+        } else {
+            timeout.as_millis().min(u32::MAX as u128) as u32
         }
     }
-
-    fn find_endpoints(handle: &DeviceHandle<Context>) -> Result<(Endpoint, Endpoint)> {
-        let mut read_endpoint: Option<Endpoint> = None;
-        let mut write_endpoint: Option<Endpoint> = None;
-
-        for n in 0..handle.device().device_descriptor()?.num_configurations() {
-            let Ok(config_desc) = handle.device().config_descriptor(n) else {
-                continue;
-            };
-
-            for interface in config_desc.interfaces() {
-                for interface_desc in interface.descriptors() {
-                    for endpoint_desc in interface_desc.endpoint_descriptors() {
-                        if endpoint_desc.transfer_type() == TransferType::Bulk
-                            && interface_desc.class_code() == LIBUSB_CLASS_VENDOR_SPEC
-                            && interface_desc.sub_class_code() == 0x42
-                            && interface_desc.protocol_code() == 0x01
-                        {
-                            let endpoint = Endpoint {
-                                iface: interface_desc.interface_number(),
-                                address: endpoint_desc.address(),
-                                max_packet_size: endpoint_desc.max_packet_size() as usize,
-                            };
-                            match endpoint_desc.direction() {
-                                Direction::In => {
-                                    if let Some(write_endpoint) = write_endpoint {
-                                        return Ok((endpoint, write_endpoint));
-                                    }
-                                    read_endpoint = Some(endpoint);
-                                }
-                                Direction::Out => {
-                                    if let Some(read_endpoint) = read_endpoint {
-                                        return Ok((read_endpoint, endpoint));
-                                    }
-                                    write_endpoint = Some(endpoint);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    #[cfg(target_os = "macos")]
+    fn iokit_error(operation: &str, status: i32) -> RustADBError {
+        // kIOReturnTimeout (iokit_common_err(0x2d6)). A reverse relay uses
+        // short reads to multiplex pending local-TCP writes with idle USB;
+        // model that normal condition as an I/O timeout instead of a failed
+        // ADB connection.
+        if status == 0xe000_02d6u32 as i32 || status == 0xe000_4051u32 as i32 {
+            return RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("macOS IOKit USB {operation} timed out"),
+            ));
         }
-
-        Err(RustADBError::USBNoDescriptorFound)
+        RustADBError::ADBRequestFailed(format!(
+            "macOS IOKit USB {operation} failed ({status:#010x})"
+        ))
     }
-
-    fn write_bulk_data(&self, data: &[u8], timeout: Duration) -> Result<()> {
-        let endpoint = self.get_write_endpoint()?;
-        let handle = self.get_raw_connection()?;
-        let max_packet_size = endpoint.max_packet_size;
-
+    #[cfg(target_os = "macos")]
+    fn write_bulk_data(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
+        let connection = self.connection()?;
+        let result = unsafe {
+            macos_iokit::macadb_write(
+                connection.handle,
+                data.as_ptr().cast(),
+                data.len().try_into()?,
+                Self::timeout_ms(timeout),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(Self::iokit_error("write", result))
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn read_exact(&mut self, data: &mut [u8], timeout: Duration) -> Result<()> {
+        let connection = self.connection()?;
         let mut offset = 0;
-        let data_len = data.len();
-        while offset < data_len {
-            let end = (offset + max_packet_size).min(data_len);
-            let write_amount = handle.write_bulk(endpoint.address, &data[offset..end], timeout)?;
-            offset += write_amount;
-
-            log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
+        while offset < data.len() {
+            let mut length: u32 = (data.len() - offset).try_into()?;
+            let result = unsafe {
+                macos_iokit::macadb_read(
+                    connection.handle,
+                    data[offset..].as_mut_ptr().cast(),
+                    &mut length,
+                    Self::timeout_ms(timeout),
+                )
+            };
+            if result != 0 {
+                return Err(Self::iokit_error("read", result));
+            }
+            if length == 0 {
+                return Err(RustADBError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ADB USB interface returned no data",
+                )));
+            }
+            offset += length as usize;
         }
-
-        if offset % max_packet_size == 0 {
-            log::trace!("must send final zero-length packet");
-            handle.write_bulk(endpoint.address, &[], timeout)?;
-        }
-
         Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.connection.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 }
 
 impl ADBTransport for USBTransport {
-    fn connect(&mut self) -> crate::Result<()> {
-        let device = self.device.open()?;
-
-        let (read_endpoint, write_endpoint) = Self::find_endpoints(&device)?;
-
-        Self::configure_endpoint(&device, &read_endpoint)?;
-        log::debug!("got read endpoint: {read_endpoint:?}");
-        self.read_endpoint = Some(read_endpoint);
-
-        Self::configure_endpoint(&device, &write_endpoint)?;
-        log::debug!("got write endpoint: {write_endpoint:?}");
-        self.write_endpoint = Some(write_endpoint);
-
-        self.handle = Some(Arc::new(device));
-
-        Ok(())
-    }
-
-    fn disconnect(&mut self) -> crate::Result<()> {
-        if self.handle.is_none() {
-            // device has not been initialized, nothing to do
+    fn connect(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.connection.is_some() {
+                return Ok(());
+            }
+            let mut handle = std::ptr::null_mut();
+            let result =
+                unsafe { macos_iokit::macadb_open(self.vendor_id, self.product_id, &mut handle) };
+            if result != 0 || handle.is_null() {
+                return Err(Self::iokit_error("open", result));
+            }
+            let max_packet_size = unsafe { macos_iokit::macadb_max_packet_size(handle) } as usize;
+            self.connection = Some(Arc::new(Mutex::new(MacOSConnection { handle })));
+            log::debug!(
+                "opened ADB USB interface for {:04x}:{:04x} (max packet size {max_packet_size})",
+                self.vendor_id,
+                self.product_id
+            );
             return Ok(());
         }
-
-        let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])?;
-        if let Err(e) = self.write_message(message) {
-            log::error!("error while sending CLSE message: {e}");
-        }
-
-        if let Some(handle) = &self.handle {
-            let endpoint = self.read_endpoint.as_ref().or(self.write_endpoint.as_ref());
-            if let Some(endpoint) = &endpoint {
-                match handle.release_interface(endpoint.iface) {
-                    Ok(()) => log::debug!("succesfully released interface"),
-                    Err(e) => log::error!("error while release interface: {e}"),
+        #[cfg(not(target_os = "macos"))]
+        Err(RustADBError::ADBRequestFailed(
+            "direct USB transport currently requires macOS".into(),
+        ))
+    }
+    fn disconnect(&mut self) -> Result<()> {
+        if self.is_connected() {
+            if let Ok(message) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]) {
+                if let Err(error) = self.write_message(message) {
+                    log::debug!("USB close message failed: {error}");
                 }
             }
         }
-
+        #[cfg(target_os = "macos")]
+        {
+            self.connection = None;
+        }
         Ok(())
     }
 }
@@ -228,58 +261,46 @@ impl ADBMessageTransport for USBTransport {
         message: ADBTransportMessage,
         timeout: Duration,
     ) -> Result<()> {
-        let message_bytes = message.header().as_bytes();
-        self.write_bulk_data(&message_bytes, timeout)?;
-
-        log::trace!("successfully write header: {} bytes", message_bytes.len());
-
+        log::trace!(
+            "sending ADB message {:?}, arg0={}, arg1={}, payload={} bytes",
+            message.header().command(),
+            message.header().arg0(),
+            message.header().arg1(),
+            message.payload().len()
+        );
+        self.write_bulk_data(&message.header().as_bytes(), timeout)?;
         let payload = message.into_payload();
         if !payload.is_empty() {
             self.write_bulk_data(&payload, timeout)?;
-            log::trace!("successfully write payload: {} bytes", payload.len());
         }
-
         Ok(())
     }
-
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
-        let endpoint = self.get_read_endpoint()?;
-        let handle = self.get_raw_connection()?;
-        let max_packet_size = endpoint.max_packet_size;
-
-        let mut data = [0u8; 24];
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = (offset + max_packet_size).min(data.len());
-            let chunk = &mut data[offset..end];
-            offset += handle.read_bulk(endpoint.address, chunk, timeout)?;
+        let mut header_bytes = [0u8; 24];
+        self.read_exact(&mut header_bytes, timeout)?;
+        let header = ADBTransportMessageHeader::try_from(header_bytes)?;
+        log::trace!(
+            "received ADB message {:?}, arg0={}, arg1={}, payload={} bytes",
+            header.command(),
+            header.arg0(),
+            header.arg1(),
+            header.data_length()
+        );
+        let mut payload = vec![0; header.data_length() as usize];
+        if !payload.is_empty() {
+            // Once a header has been consumed, a payload timeout is fatal;
+            // treating it as an idle poll would parse payload as the next header.
+            self.read_exact(&mut payload, Duration::from_secs(5)).map_err(|error| {
+                RustADBError::ADBRequestFailed(format!("incomplete USB packet: {error}"))
+            })?;
         }
-
-        let header = ADBTransportMessageHeader::try_from(data)?;
-        log::trace!("received header {header:?}");
-
-        if header.data_length() != 0 {
-            let mut msg_data = vec![0_u8; header.data_length() as usize];
-            let mut offset = 0;
-            while offset < msg_data.len() {
-                let end = (offset + max_packet_size).min(msg_data.len());
-                let chunk = &mut msg_data[offset..end];
-                offset += handle.read_bulk(endpoint.address, chunk, timeout)?;
-            }
-
-            let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
-
-            // Check message integrity
-            if !message.check_message_integrity() {
-                return Err(RustADBError::InvalidIntegrity(
-                    ADBTransportMessageHeader::compute_crc32(message.payload()),
-                    message.header().data_crc32(),
-                ));
-            }
-
-            return Ok(message);
+        let message = ADBTransportMessage::from_header_and_payload(header, payload);
+        if !message.check_message_integrity() {
+            return Err(RustADBError::InvalidIntegrity(
+                ADBTransportMessageHeader::compute_crc32(message.payload()),
+                message.header().data_crc32(),
+            ));
         }
-
-        Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
+        Ok(message)
     }
 }

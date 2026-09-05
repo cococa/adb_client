@@ -12,6 +12,27 @@ use crate::{ADBStatExtendedResponse, RebootType, Result};
 
 /// Trait representing all features available on ADB devices.
 pub trait ADBDeviceExt {
+    /// Installs a reverse socket rule on a directly connected Android device.
+    fn reverse_forward(&mut self, _remote: String, _local: String) -> Result<()> {
+        Err(crate::RustADBError::ADBRequestFailed(
+            "reverse forwarding is unavailable for this transport".to_string(),
+        ))
+    }
+
+    /// Serve a direct-USB reverse rule until the transport disconnects.
+    fn run_reverse_relay(&mut self, _remote: String, _local: String) -> Result<()> {
+        Err(crate::RustADBError::ADBRequestFailed(
+            "reverse relay is unavailable for this transport".to_string(),
+        ))
+    }
+
+    /// Remove one direct-USB reverse rule.
+    fn remove_reverse_forward(&mut self, _remote: String) -> Result<()> {
+        Err(crate::RustADBError::ADBRequestFailed(
+            "reverse forwarding is unavailable for this transport".to_string(),
+        ))
+    }
+
     /// Runs command in a shell on the device, and write its output and error streams into output.
     fn shell_command(
         &mut self,

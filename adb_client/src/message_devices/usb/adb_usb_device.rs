@@ -8,6 +8,7 @@ use crate::ADBListItemType;
 use crate::Result;
 use crate::RustADBError;
 use crate::message_devices::adb_message_device::ADBMessageDevice;
+use crate::message_devices::dispatched_device::DispatchedADBMessageDevice;
 use crate::models::RemountInfo;
 use crate::usb::usb_transport::USBTransport;
 use crate::usb::utils;
@@ -17,6 +18,14 @@ use crate::utils::get_default_adb_key_path;
 #[derive(Debug)]
 pub struct ADBUSBDevice {
     inner: ADBMessageDevice<USBTransport>,
+    vendor_id: u16,
+    product_id: u16,
+}
+
+/// A direct USB device whose packets are routed by one shared dispatcher.
+#[derive(Debug)]
+pub struct ADBDispatchedUSBDevice {
+    inner: DispatchedADBMessageDevice,
     vendor_id: u16,
     product_id: u16,
 }
@@ -101,9 +110,103 @@ impl ADBUSBDevice {
             )),
         }
     }
+
+    /// Installs a direct-USB reverse socket rule on the Android device.
+    ///
+    /// `remote` is the device-side endpoint (for example
+    /// `localabstract:scrcpy`) and `local` is the Mac TCP endpoint.
+    pub fn reverse_forward(&mut self, remote: String, local: String) -> Result<()> {
+        self.inner.reverse_forward(remote, local)
+    }
+
+    /// Register and serve one direct-USB reverse route until its transport is
+    /// disconnected. This is the data plane used by the scrcpy socket relay.
+    pub fn run_reverse_relay(&mut self, remote: String, local: String) -> Result<()> {
+        self.inner.run_reverse_relay(remote, local)
+    }
+
+    /// Remove a previously registered direct-USB reverse rule.
+    pub fn remove_reverse_forward(&mut self, remote: String) -> Result<()> {
+        self.inner.remove_reverse_forward(remote)
+    }
+
+    /// Transfers the authenticated USB connection to the one-reader dispatcher.
+    pub fn into_dispatched(self) -> ADBDispatchedUSBDevice {
+        ADBDispatchedUSBDevice {
+            inner: self.inner.into_dispatched(),
+            vendor_id: self.vendor_id,
+            product_id: self.product_id,
+        }
+    }
+}
+
+impl ADBDispatchedUSBDevice {
+    /// Serves local TCP forwarding through the authenticated USB transport.
+    pub fn serve_forward(self: std::sync::Arc<Self>, local: String, remote: String) -> Result<()> {
+        self.inner.serve_forward(local, remote)
+    }
+    /// Lists local-to-remote TCP forwarding rules owned by this connection.
+    pub fn forward_routes(&self) -> Vec<(String, String)> { self.inner.forward_routes() }
+    /// Stops a local TCP forwarding rule and returns whether it existed.
+    pub fn remove_forward(&self, local: &str) -> bool { self.inner.remove_forward(local) }
+    /// Returns reverse routes registered on this device.
+    pub fn reverse_routes(&self) -> Result<Vec<(String, String)>> { self.inner.reverse_routes() }
+    /// Removes all reverse routes registered by this client.
+    pub fn remove_all_reverse_routes(&self) -> Result<()> { self.inner.remove_all_reverse_routes() }
+    /// Requests an adbd restart with root privileges.
+    pub fn root(&self) -> Result<()> { self.inner.root() }
+    /// Requests a remount of writable partitions.
+    pub fn remount(&self) -> Result<()> { self.inner.remount() }
+    /// Whether the USB reader is still connected.
+    pub fn is_alive(&self) -> bool { self.inner.is_alive() }
+
+    /// Downloads a file through the shared USB sync transport.
+    pub fn pull(&self, path: &str, output: &mut dyn Write) -> Result<()> {
+        self.inner.pull(path, output)
+    }
+
+    /// Streams raw command output through the shared USB transport.
+    pub fn exec_out(&self, command: &str, output: &mut dyn Write) -> Result<()> {
+        self.inner.exec_out(command, output)
+    }
+
+    /// Executes a shell command through a routed ADB session.
+    pub fn shell_command(&self, command: &str, stdout: Option<&mut dyn Write>) -> Result<()> {
+        self.inner.shell_command(command, stdout)
+    }
+
+    /// Uploads a file through a routed sync session.
+    pub fn push<R: Read>(&self, input: R, path: &str) -> Result<()> {
+        self.inner.push(input, path)
+    }
+
+    /// Registers a reverse route through the shared transport.
+    pub fn reverse_forward(&self, remote: String, local: String) -> Result<()> {
+        self.inner.reverse_forward(remote, local)
+    }
+
+    /// Removes a reverse route through the shared transport.
+    pub fn remove_reverse_forward(&self, remote: String) -> Result<()> {
+        self.inner.remove_reverse_forward(remote)
+    }
 }
 
 impl ADBDeviceExt for ADBUSBDevice {
+    #[inline]
+    fn reverse_forward(&mut self, remote: String, local: String) -> Result<()> {
+        self.reverse_forward(remote, local)
+    }
+
+    #[inline]
+    fn run_reverse_relay(&mut self, remote: String, local: String) -> Result<()> {
+        self.run_reverse_relay(remote, local)
+    }
+
+    #[inline]
+    fn remove_reverse_forward(&mut self, remote: String) -> Result<()> {
+        self.remove_reverse_forward(remote)
+    }
+
     #[inline]
     fn shell_command(
         &mut self,

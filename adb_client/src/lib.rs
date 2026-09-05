@@ -1,5 +1,7 @@
 #![crate_type = "lib"]
-#![forbid(unsafe_code)]
+// macOS USB transport calls the public IOKit interface API through a small,
+// isolated native bridge. Other targets retain the crate's no-unsafe policy.
+#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 #![forbid(missing_debug_implementations)]
 #![forbid(missing_docs)]
 #![allow(clippy::missing_errors_doc)]

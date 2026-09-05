@@ -12,8 +12,11 @@ mod adb_message_transport;
 mod adb_session;
 mod adb_transport_message;
 mod commands;
+mod dispatched_device;
 mod message_commands;
 mod models;
+mod reverse_relay;
+mod transport_dispatcher;
 mod utils;
 
 pub use utils::BinaryDecodable;

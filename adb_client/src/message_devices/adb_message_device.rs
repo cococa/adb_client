@@ -33,7 +33,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 "No private key found at path {}. Generating a new random.",
                 adb_private_key_path.as_ref().display()
             );
-            ADBRsaKey::new_random()?
+            let private_key = ADBRsaKey::new_random()?;
+            private_key.write_pkcs8(&adb_private_key_path)?;
+            private_key
         };
 
         let mut message_device = Self { transport };
@@ -44,6 +46,25 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
     pub(crate) const fn get_transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    /// Transfers the authenticated transport to the packet dispatcher. Once
+    /// moved, only the dispatcher may read USB packets; consumers receive
+    /// packets by their ADB local-id instead of racing on the USB endpoint.
+    pub(crate) fn into_transport(self) -> T {
+        // Suppress the legacy disconnect while moving (not cloning) its sole
+        // field. The dispatcher now owns and eventually drops the transport.
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: this is never dropped or accessed again; transport is moved once.
+        unsafe { std::ptr::read(&this.transport) }
+    }
+
+    pub(crate) fn into_dispatched(
+        self,
+    ) -> crate::message_devices::dispatched_device::DispatchedADBMessageDevice {
+        crate::message_devices::dispatched_device::DispatchedADBMessageDevice::new(
+            self.into_transport(),
+        )
     }
 
     /// Send initial connect
@@ -112,47 +133,86 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             }
         };
 
-        let sign = private_key.sign(auth_message.into_payload())?;
-
-        let message = ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign)?;
-
-        self.transport.write_message(message)?;
-
-        let received_response = self.transport.read_message()?;
-
-        if received_response.header().command() == MessageCommand::Cnxn {
-            log::info!(
-                "Authentication OK, device info {}",
-                String::from_utf8(received_response.into_payload())?
-            );
-            return Ok(());
+        // Devices can issue another token while the user is deciding the RSA
+        // dialog. Alternate signature and public-key replies until adbd
+        // confirms the connection, rather than treating that normal AUTH as a
+        // protocol error.
+        let mut response = auth_message;
+        let mut send_public_key = false;
+        for _ in 0..8 {
+            match response.header().command() {
+                MessageCommand::Cnxn => {
+                    log::info!(
+                        "Authentication OK, device info {}",
+                        String::from_utf8(response.into_payload())?
+                    );
+                    return Ok(());
+                }
+                MessageCommand::Auth if response.header().arg0() == AUTH_TOKEN => {
+                    let (auth_type, payload) = if send_public_key {
+                        let mut public_key = private_key.android_pubkey_encode()?.into_bytes();
+                        public_key.push(b'\0');
+                        (AUTH_RSAPUBLICKEY, public_key)
+                    } else {
+                        (AUTH_SIGNATURE, private_key.sign(response.into_payload())?)
+                    };
+                    self.transport.write_message(ADBTransportMessage::try_new(
+                        MessageCommand::Auth,
+                        auth_type,
+                        0,
+                        &payload,
+                    )?)?;
+                    send_public_key = !send_public_key;
+                    response = self
+                        .transport
+                        .read_message_with_timeout(Duration::from_secs(15))?;
+                }
+                MessageCommand::Auth => {
+                    return Err(crate::RustADBError::ADBRequestFailed(format!(
+                        "Received AUTH message with type != 1 ({})",
+                        response.header().arg0()
+                    )));
+                }
+                command => {
+                    return Err(crate::RustADBError::WrongResponseReceived(
+                        "Expected CNXN or AUTH command".to_string(),
+                        command.to_string(),
+                    ));
+                }
+            }
         }
-
-        let mut pubkey = private_key.android_pubkey_encode()?.into_bytes();
-        pubkey.push(b'\0');
-
-        let message =
-            ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey)?;
-
-        self.transport.write_message(message)?;
-
-        let response = self
-            .transport
-            .read_message_with_timeout(Duration::from_secs(10))
-            .and_then(|message| {
-                message.assert_command(MessageCommand::Cnxn)?;
-                Ok(message)
-            })?;
-
-        log::info!(
-            "Authentication OK, device info {}",
-            String::from_utf8(response.into_payload())?
-        );
-        Ok(())
+        Err(crate::RustADBError::ADBRequestFailed(
+            "Android device did not finish RSA authorization".to_string(),
+        ))
     }
 
     pub(crate) fn open_synchronization_session(&mut self) -> Result<ADBSession<T>> {
         self.open_session(&ADBLocalCommand::Sync)
+    }
+
+    /// Installs a reverse socket rule directly on adbd. Unlike `host:forward`,
+    /// this service is available over a direct USB ADB connection and is the
+    /// foundation for the scrcpy server's connection back to the Mac.
+    pub(crate) fn reverse_forward(&mut self, remote: String, local: String) -> Result<()> {
+        let _session = self.open_session(&ADBLocalCommand::Reverse(remote, local))?;
+        Ok(())
+    }
+
+    /// Register a reverse rule and keep this authenticated transport alive to
+    /// relay device-initiated socket streams to the specified local TCP port.
+    pub(crate) fn run_reverse_relay(&mut self, remote: String, local: String) -> Result<()> {
+        self.reverse_forward(remote.clone(), local.clone())?;
+        crate::message_devices::reverse_relay::ReverseRelay::new(
+            &mut self.transport,
+            remote,
+            local,
+        )?
+        .run()
+    }
+
+    pub(crate) fn remove_reverse_forward(&mut self, remote: String) -> Result<()> {
+        let _session = self.open_session(&ADBLocalCommand::ReverseRemove(remote))?;
+        Ok(())
     }
 
     /// Open a new ADB session with the given local command.

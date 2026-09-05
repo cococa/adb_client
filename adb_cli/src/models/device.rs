@@ -15,6 +15,12 @@ pub enum DeviceCommands {
     Pull { source: String, destination: String },
     /// Push a file on device
     Push { filename: String, path: String },
+    /// Reverse a device-side socket to a Mac TCP endpoint (direct USB only)
+    Reverse { remote: String, local: String },
+    /// Register and continuously serve a reverse route (for example, scrcpy)
+    ReverseRelay { remote: String, local: String },
+    /// Remove a direct-USB reverse route
+    ReverseRemove { remote: String },
     /// Stat a file on device
     Stat { path: String },
     /// Stat a file on device with extended information
