@@ -9,7 +9,11 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver, Sender}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::Duration,
 };
@@ -38,8 +42,14 @@ enum DispatcherCommand {
     Unregister {
         local_id: u32,
     },
-    Route { remote: String, local: Option<String>, completion: Sender<()> },
-    Routes { completion: Sender<Vec<(String, String)>> },
+    Route {
+        remote: String,
+        local: Option<String>,
+        completion: Sender<()>,
+    },
+    Routes {
+        completion: Sender<Vec<(String, String)>>,
+    },
     Shutdown,
 }
 
@@ -66,7 +76,9 @@ impl DispatchedSession {
         match self.packet_rx.recv_timeout(timeout) {
             Ok(packet) => Ok(Some(packet)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RustADBError::ADBRequestFailed("ADB packet dispatcher stopped".to_owned())),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RustADBError::ADBRequestFailed(
+                "ADB packet dispatcher stopped".to_owned(),
+            )),
         }
     }
 
@@ -144,24 +156,36 @@ impl TransportDispatcher {
         })
     }
 
-    pub(crate) fn is_alive(&self) -> bool { self.alive.load(Ordering::Acquire) }
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
 
     pub(crate) fn set_route(&self, remote: String, local: Option<String>) -> Result<()> {
         let (tx, rx) = mpsc::channel();
-        self.command_tx.send(DispatcherCommand::Route { remote, local, completion: tx })
+        self.command_tx
+            .send(DispatcherCommand::Route {
+                remote,
+                local,
+                completion: tx,
+            })
             .map_err(|_| RustADBError::ADBRequestFailed("dispatcher stopped".into()))?;
-        rx.recv().map_err(|_| RustADBError::ADBRequestFailed("dispatcher stopped".into()))
+        rx.recv()
+            .map_err(|_| RustADBError::ADBRequestFailed("dispatcher stopped".into()))
     }
 
     pub(crate) fn routes(&self) -> Result<Vec<(String, String)>> {
         let (tx, rx) = mpsc::channel();
-        self.command_tx.send(DispatcherCommand::Routes { completion: tx })
+        self.command_tx
+            .send(DispatcherCommand::Routes { completion: tx })
             .map_err(|_| RustADBError::ADBRequestFailed("dispatcher stopped".into()))?;
-        rx.recv().map_err(|_| RustADBError::ADBRequestFailed("dispatcher stopped".into()))
+        rx.recv()
+            .map_err(|_| RustADBError::ADBRequestFailed("dispatcher stopped".into()))
     }
 
     pub(crate) fn receive_open(&self) -> Result<ADBTransportMessage> {
-        self.incoming_open_rx.lock().unwrap()
+        self.incoming_open_rx
+            .lock()
+            .unwrap()
             .recv()
             .map_err(|_| RustADBError::ADBRequestFailed("ADB packet dispatcher stopped".to_owned()))
     }
@@ -205,13 +229,25 @@ fn run_loop<T: ADBMessageTransport>(
                 DispatcherCommand::Unregister { local_id } => {
                     sessions.remove(&local_id);
                 }
-                DispatcherCommand::Route { remote, local, completion } => {
-                    if let Some(local) = local { routes.insert(remote, local); }
-                    else { routes.remove(&remote); }
+                DispatcherCommand::Route {
+                    remote,
+                    local,
+                    completion,
+                } => {
+                    if let Some(local) = local {
+                        routes.insert(remote, local);
+                    } else {
+                        routes.remove(&remote);
+                    }
                     let _ = completion.send(());
                 }
                 DispatcherCommand::Routes { completion } => {
-                    let _ = completion.send(routes.iter().map(|(remote, local)| (remote.clone(), local.clone())).collect());
+                    let _ = completion.send(
+                        routes
+                            .iter()
+                            .map(|(remote, local)| (remote.clone(), local.clone()))
+                            .collect(),
+                    );
                 }
                 DispatcherCommand::Shutdown => return,
             }
@@ -224,30 +260,52 @@ fn run_loop<T: ADBMessageTransport>(
                     // the Android localabstract endpoint used to register it.
                     let destination = String::from_utf8_lossy(packet.payload());
                     let destination = destination.trim_end_matches('\0');
-                    eprintln!("[adb_client] device OPEN destination={destination} routes={:?}", routes);
+                    eprintln!(
+                        "[adb_client] device OPEN destination={destination} routes={:?}",
+                        routes
+                    );
                     // For reverse forwarding, adbd opens the configured
                     // remote endpoint (the map key); the map value is the
                     // host TCP listener to which that connection is relayed.
                     let local = routes.get(destination).or_else(|| {
-                        routes.values().find(|candidate| candidate.as_str() == destination)
+                        routes
+                            .values()
+                            .find(|candidate| candidate.as_str() == destination)
                     });
                     if let Some(local) = local {
-                        if let Some(port) = local.strip_prefix("tcp:").and_then(|s| s.parse::<u16>().ok()) {
-                            let local_id = (1..u32::MAX).find(|id| !sessions.contains_key(id)).unwrap();
+                        if let Some(port) = local
+                            .strip_prefix("tcp:")
+                            .and_then(|s| s.parse::<u16>().ok())
+                        {
+                            let local_id =
+                                (1..u32::MAX).find(|id| !sessions.contains_key(id)).unwrap();
                             let (tx, rx) = mpsc::channel();
                             sessions.insert(local_id, tx);
-                            let session = DispatchedSession { local_id, command_tx: command_tx.clone(), packet_rx: rx };
+                            let session = DispatchedSession {
+                                local_id,
+                                command_tx: command_tx.clone(),
+                                packet_rx: rx,
+                            };
                             let remote_id = packet.header().arg0();
                             thread::spawn(move || {
                                 if let Err(error) = relay(session, remote_id, port) {
-                                    eprintln!("[adb_client] reverse relay failed for tcp:{port}: {error}");
+                                    eprintln!(
+                                        "[adb_client] reverse relay failed for tcp:{port}: {error}"
+                                    );
                                     log::debug!("reverse relay closed: {error}");
                                 }
                             });
                         }
                     } else {
-                        let _ = transport.write_message(ADBTransportMessage::try_new(
-                            MessageCommand::Clse, 0, packet.header().arg0(), &[]).unwrap());
+                        let _ = transport.write_message(
+                            ADBTransportMessage::try_new(
+                                MessageCommand::Clse,
+                                0,
+                                packet.header().arg0(),
+                                &[],
+                            )
+                            .unwrap(),
+                        );
                         #[cfg(test)]
                         let _ = incoming_open_tx.send(packet);
                     }
@@ -269,9 +327,9 @@ fn run_loop<T: ADBMessageTransport>(
                 // Wake every in-flight operation so callers fail immediately
                 // instead of waiting for a USB timeout after unplug/replug.
                 for (local_id, session_tx) in sessions.drain() {
-                    if let Ok(close) = ADBTransportMessage::try_new(
-                        MessageCommand::Clse, 0, local_id, &[]
-                    ) {
+                    if let Ok(close) =
+                        ADBTransportMessage::try_new(MessageCommand::Clse, 0, local_id, &[])
+                    {
                         let _ = session_tx.send(close);
                     }
                 }
@@ -358,59 +416,121 @@ mod tests {
     }
     #[test]
     fn reverse_relays_video_and_obeys_control_write_acknowledgements() {
-        use std::{io::{Read, Write}, net::TcpListener};
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let local = format!("tcp:{}", listener.local_addr().unwrap().port());
         let (input, incoming) = mpsc::channel();
         let (written, output) = mpsc::channel();
         let dispatcher = TransportDispatcher::start(TestTransport {
-            incoming: Arc::new(Mutex::new(incoming)), written,
+            incoming: Arc::new(Mutex::new(incoming)),
+            written,
         });
-        dispatcher.set_route("localabstract:scrcpy_test".into(), Some(local.clone())).unwrap();
-        input.send(ADBTransportMessage::try_new(MessageCommand::Open, 99, 0, local.as_bytes()).unwrap()).unwrap();
+        dispatcher
+            .set_route("localabstract:scrcpy_test".into(), Some(local.clone()))
+            .unwrap();
+        input
+            .send(
+                ADBTransportMessage::try_new(MessageCommand::Open, 99, 0, local.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
         let okay = output.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(okay.header().command(), MessageCommand::Okay);
         let id = okay.header().arg0();
         let (mut socket, _) = listener.accept().unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        input.send(ADBTransportMessage::try_new(MessageCommand::Write, 99, id, b"frame").unwrap()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        input
+            .send(ADBTransportMessage::try_new(MessageCommand::Write, 99, id, b"frame").unwrap())
+            .unwrap();
         let mut frame = [0; 5];
         socket.read_exact(&mut frame).unwrap();
         assert_eq!(&frame, b"frame");
-        assert_eq!(output.recv_timeout(Duration::from_secs(2)).unwrap().header().command(), MessageCommand::Okay);
+        assert_eq!(
+            output
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .header()
+                .command(),
+            MessageCommand::Okay
+        );
         socket.write_all(b"tap").unwrap();
-        assert_eq!(output.recv_timeout(Duration::from_secs(2)).unwrap().payload(), b"tap");
+        assert_eq!(
+            output
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .payload(),
+            b"tap"
+        );
         socket.write_all(b"swipe").unwrap();
         assert!(output.recv_timeout(Duration::from_millis(50)).is_err());
-        input.send(ADBTransportMessage::try_new(MessageCommand::Okay, 99, id, &[]).unwrap()).unwrap();
-        assert_eq!(output.recv_timeout(Duration::from_secs(2)).unwrap().payload(), b"swipe");
+        input
+            .send(ADBTransportMessage::try_new(MessageCommand::Okay, 99, id, &[]).unwrap())
+            .unwrap();
+        assert_eq!(
+            output
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .payload(),
+            b"swipe"
+        );
         // Another shell session can progress while relay control waits for ACK.
         let shell = dispatcher.register(123).unwrap();
-        input.send(ADBTransportMessage::try_new(MessageCommand::Write, 88, 123, b"model").unwrap()).unwrap();
+        input
+            .send(ADBTransportMessage::try_new(MessageCommand::Write, 88, 123, b"model").unwrap())
+            .unwrap();
         assert_eq!(shell.receive().unwrap().payload(), b"model");
-        input.send(ADBTransportMessage::try_new(MessageCommand::Clse, 99, id, &[]).unwrap()).unwrap();
-        assert_eq!(output.recv_timeout(Duration::from_secs(2)).unwrap().header().command(), MessageCommand::Clse);
+        input
+            .send(ADBTransportMessage::try_new(MessageCommand::Clse, 99, id, &[]).unwrap())
+            .unwrap();
+        assert_eq!(
+            output
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .header()
+                .command(),
+            MessageCommand::Clse
+        );
     }
-
 }
 
 // One outstanding host WRTE per stream. Device video/audio writes continue
 // to be acknowledged while waiting for control-input acknowledgements.
 fn relay(session: DispatchedSession, remote_id: u32, port: u16) -> Result<()> {
-    use std::{io::{Read, Write}, net::{TcpStream, Shutdown}};
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpStream},
+    };
     let mut socket = match TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(2)) {
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(2),
+    ) {
         Ok(socket) => socket,
         Err(error) => {
-            session.send(ADBTransportMessage::try_new(MessageCommand::Clse, 0, remote_id, &[])?)?;
+            session.send(ADBTransportMessage::try_new(
+                MessageCommand::Clse,
+                0,
+                remote_id,
+                &[],
+            )?)?;
             return Err(error.into());
         }
     };
     socket.set_nodelay(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(1)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let send = |command, payload: &[u8]| session.send(ADBTransportMessage::try_new(
-        command, session.local_id, remote_id, payload)?);
+    let send = |command, payload: &[u8]| {
+        session.send(ADBTransportMessage::try_new(
+            command,
+            session.local_id,
+            remote_id,
+            payload,
+        )?)
+    };
     send(MessageCommand::Okay, &[])?;
     let result = (|| -> Result<()> {
         let mut pending_write = false;
@@ -424,16 +544,27 @@ fn relay(session: DispatchedSession, remote_id: u32, port: u16) -> Result<()> {
                     }
                     MessageCommand::Okay => pending_write = false,
                     MessageCommand::Clse => return Ok(()),
-                    _ => return Err(RustADBError::ADBRequestFailed("unexpected relay packet".into())),
+                    _ => {
+                        return Err(RustADBError::ADBRequestFailed(
+                            "unexpected relay packet".into(),
+                        ));
+                    }
                 },
-                Err(mpsc::RecvTimeoutError::Timeout) => {},
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return Ok(()),
             }
             if !pending_write {
                 match socket.read(&mut buffer) {
                     Ok(0) => return Ok(()),
-                    Ok(length) => { send(MessageCommand::Write, &buffer[..length])?; pending_write = true; }
-                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {},
+                    Ok(length) => {
+                        send(MessageCommand::Write, &buffer[..length])?;
+                        pending_write = true;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
                     Err(error) => return Err(error.into()),
                 }
             }

@@ -36,6 +36,21 @@ impl ADBTcpDevice {
 
 impl ADBDeviceExt for ADBTcpDevice {
     #[inline]
+    fn reverse_forward(&mut self, remote: String, local: String) -> Result<()> {
+        self.inner.reverse_forward(remote, local)
+    }
+
+    #[inline]
+    fn run_reverse_relay(&mut self, remote: String, local: String) -> Result<()> {
+        self.inner.run_reverse_relay(remote, local)
+    }
+
+    #[inline]
+    fn remove_reverse_forward(&mut self, remote: String) -> Result<()> {
+        self.inner.remove_reverse_forward(remote)
+    }
+
+    #[inline]
     fn shell_command(
         &mut self,
         command: &dyn AsRef<str>,

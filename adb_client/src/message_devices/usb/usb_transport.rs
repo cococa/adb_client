@@ -90,6 +90,20 @@ impl std::fmt::Debug for USBTransport {
 impl USBTransport {
     /// Creates a transport for a discovered ADB USB device.
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            // Discovery and open both use the native IOKit interface API.
+            // nusb occasionally omits the descriptor for an otherwise valid
+            // Android composite-device interface on macOS.
+            return Ok(Self {
+                vendor_id,
+                product_id,
+                connection: None,
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
         let device_info = nusb::list_devices()
             .wait()?
             .find(|device| {
@@ -99,6 +113,7 @@ impl USBTransport {
             })
             .ok_or(RustADBError::USBDeviceNotFound(vendor_id, product_id))?;
         Self::new_from_device(device_info)
+        }
     }
     /// Creates a transport from a device returned by USB discovery.
     pub fn new_from_device(device_info: DeviceInfo) -> Result<Self> {
@@ -290,9 +305,10 @@ impl ADBMessageTransport for USBTransport {
         if !payload.is_empty() {
             // Once a header has been consumed, a payload timeout is fatal;
             // treating it as an idle poll would parse payload as the next header.
-            self.read_exact(&mut payload, Duration::from_secs(5)).map_err(|error| {
-                RustADBError::ADBRequestFailed(format!("incomplete USB packet: {error}"))
-            })?;
+            self.read_exact(&mut payload, Duration::from_secs(5))
+                .map_err(|error| {
+                    RustADBError::ADBRequestFailed(format!("incomplete USB packet: {error}"))
+                })?;
         }
         let message = ADBTransportMessage::from_header_and_payload(header, payload);
         if !message.check_message_integrity() {

@@ -12,6 +12,11 @@ typedef struct {
     UInt16 max_packet_size;
 } macadb_interface;
 
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t product_id;
+} macadb_device_info;
+
 static int property_u16(io_registry_entry_t service, CFStringRef key, UInt16 *value) {
     CFTypeRef property = IORegistryEntrySearchCFProperty(
         service, kIOServicePlane, key, kCFAllocatorDefault,
@@ -22,6 +27,61 @@ static int property_u16(io_registry_entry_t service, CFStringRef key, UInt16 *va
     CFRelease(property);
     return ok;
 }
+
+// nusb can enumerate a composite Android device on macOS without retaining its
+// interface descriptors.  Discover through IOKit instead, which is also the
+// API used for the actual interface open below.
+int macadb_list(macadb_device_info **output, size_t *count) {
+    *output = NULL;
+    *count = 0;
+    CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBInterfaceClassName);
+    io_iterator_t iterator = 0;
+    IOReturn result = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator);
+    if (result != kIOReturnSuccess) return result;
+
+    macadb_device_info *devices = NULL;
+    size_t capacity = 0;
+    io_service_t service;
+    while ((service = IOIteratorNext(iterator))) {
+        UInt16 vendor = 0, product = 0;
+        UInt16 klass = 0, subclass = 0, protocol = 0;
+        int is_adb = property_u16(service, CFSTR("bInterfaceClass"), &klass)
+            && property_u16(service, CFSTR("bInterfaceSubClass"), &subclass)
+            && property_u16(service, CFSTR("bInterfaceProtocol"), &protocol)
+            && klass == 0xff && subclass == 0x42 && protocol == 0x01
+            && property_u16(service, CFSTR("idVendor"), &vendor)
+            && property_u16(service, CFSTR("idProduct"), &product);
+        IOObjectRelease(service);
+        if (!is_adb) continue;
+
+        int duplicate = 0;
+        for (size_t index = 0; index < *count; index++) {
+            if (devices[index].vendor_id == vendor && devices[index].product_id == product) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (*count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 4;
+            macadb_device_info *next = realloc(devices, next_capacity * sizeof(*devices));
+            if (!next) {
+                free(devices);
+                IOObjectRelease(iterator);
+                return kIOReturnNoMemory;
+            }
+            devices = next;
+            capacity = next_capacity;
+        }
+        devices[*count] = (macadb_device_info) { vendor, product };
+        *count += 1;
+    }
+    IOObjectRelease(iterator);
+    *output = devices;
+    return kIOReturnSuccess;
+}
+
+void macadb_list_free(macadb_device_info *devices) { free(devices); }
 
 int macadb_open(uint16_t wanted_vendor, uint16_t wanted_product, macadb_interface **output) {
     *output = NULL;

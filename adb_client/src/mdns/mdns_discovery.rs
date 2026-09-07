@@ -3,19 +3,20 @@ use std::{sync::mpsc::Sender, thread::JoinHandle};
 
 use crate::{Result, RustADBError, mdns::MDNSDevice};
 
-const ADB_SERVICE_NAME: &str = "_adb-tls-connect._tcp.local.";
+const ADB_CONNECT_SERVICE_NAME: &str = "_adb-tls-connect._tcp.local.";
+const ADB_PAIRING_SERVICE_NAME: &str = "_adb-tls-pairing._tcp.local.";
 
 /// Structure holding responsibility over mdns discovery
 pub struct MDNSDiscoveryService {
     daemon: ServiceDaemon,
-    thread_handle: Option<JoinHandle<Result<()>>>,
+    thread_handles: Vec<JoinHandle<Result<()>>>,
 }
 
 impl std::fmt::Debug for MDNSDiscoveryService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MDNSDiscoveryService")
             .field("daemon", &self.daemon.get_metrics())
-            .field("handle", &self.thread_handle)
+            .field("handles", &self.thread_handles)
             .finish()
     }
 }
@@ -25,30 +26,31 @@ impl MDNSDiscoveryService {
     pub fn new() -> Result<Self> {
         Ok(Self {
             daemon: ServiceDaemon::new()?,
-            thread_handle: None,
+            thread_handles: Vec::new(),
         })
     }
 
     /// Start discovery by spawning a new background thread responsible of getting events.
     pub fn start(&mut self, sender: Sender<MDNSDevice>) -> Result<()> {
-        let receiver = self.daemon.browse(ADB_SERVICE_NAME)?;
-
-        let handle: JoinHandle<Result<()>> = std::thread::spawn(move || {
-            loop {
-                while let Ok(event) = receiver.recv() {
-                    if let ServiceEvent::ServiceResolved(service_info) = event {
-                        match MDNSDevice::try_from(service_info) {
-                            Ok(device) => {
-                                sender.send(device).map_err(|_| RustADBError::SendError)?;
+        for service_name in [ADB_CONNECT_SERVICE_NAME, ADB_PAIRING_SERVICE_NAME] {
+            let receiver = self.daemon.browse(service_name)?;
+            let sender = sender.clone();
+            let handle: JoinHandle<Result<()>> = std::thread::spawn(move || {
+                loop {
+                    while let Ok(event) = receiver.recv() {
+                        if let ServiceEvent::ServiceResolved(service_info) = event {
+                            match MDNSDevice::try_from(service_info) {
+                                Ok(device) => {
+                                    sender.send(device).map_err(|_| RustADBError::SendError)?;
+                                }
+                                Err(e) => log::error!("got error with device: {e}"),
                             }
-                            Err(e) => log::error!("got error with device: {e}"),
                         }
                     }
                 }
-            }
-        });
-
-        self.thread_handle = Some(handle);
+            });
+            self.thread_handles.push(handle);
+        }
 
         Ok(())
     }

@@ -48,17 +48,20 @@ impl ADBRsaInternalPublicKey {
 }
 
 #[derive(Debug, Clone)]
+/// A host RSA identity used by Android Debug Bridge authentication.
 pub struct ADBRsaKey {
     private_key: RsaPrivateKey,
 }
 
 impl ADBRsaKey {
+    /// Generates a new 2048-bit host identity.
     pub fn new_random() -> Result<Self> {
         Ok(Self {
             private_key: RsaPrivateKey::new(&mut rsa::rand_core::OsRng, ADB_PRIVATE_KEY_SIZE)?,
         })
     }
 
+    /// Loads a host identity from PKCS#8 PEM text.
     pub fn new_from_pkcs8(pkcs8_content: &str) -> Result<Self> {
         Ok(Self {
             private_key: RsaPrivateKey::from_pkcs8_pem(pkcs8_content)?,
@@ -83,6 +86,7 @@ impl ADBRsaKey {
         Ok(())
     }
 
+    /// Encodes the public half in Android's `adbkey.pub` wire format.
     pub fn android_pubkey_encode(&self) -> Result<String> {
         // Helped from project: https://github.com/hajifkd/webadb
         // Source code: https://android.googlesource.com/platform/system/core/+/refs/heads/main/libcrypto_utils/android_pubkey.cpp
@@ -117,11 +121,17 @@ impl ADBRsaKey {
         Ok(Self::encode_public_key(adb_rsa_pubkey.into_bytes()))
     }
 
+    /// Serializes the host key for use by the wireless-pairing TLS identity.
+    pub fn to_pkcs8_pem(&self) -> Result<String> {
+        Ok(self.private_key.to_pkcs8_pem(LineEnding::LF)?.to_string())
+    }
+
     fn encode_public_key(pub_key: Vec<u8>) -> String {
         let encoded = STANDARD.encode(pub_key);
         format!("{encoded} adb_client@{}", env!("CARGO_PKG_VERSION"))
     }
 
+    /// Signs an ADB authentication token with this host identity.
     pub fn sign(&self, msg: impl AsRef<[u8]>) -> Result<Vec<u8>> {
         Ok(self
             .private_key
@@ -129,6 +139,7 @@ impl ADBRsaKey {
     }
 }
 
+/// Reads a PKCS#8 host identity, returning `None` when the file does not exist.
 pub fn read_adb_private_key<P: AsRef<Path>>(private_key_path: P) -> Result<Option<ADBRsaKey>> {
     // Try to read the private key file from given path
     // If the file is not found, return None

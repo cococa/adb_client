@@ -19,4 +19,5 @@ mod reverse_relay;
 mod transport_dispatcher;
 mod utils;
 
+pub use models::{ADBRsaKey, read_adb_private_key};
 pub use utils::BinaryDecodable;

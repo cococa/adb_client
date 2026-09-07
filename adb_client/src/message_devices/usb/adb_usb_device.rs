@@ -146,19 +146,37 @@ impl ADBDispatchedUSBDevice {
         self.inner.serve_forward(local, remote)
     }
     /// Lists local-to-remote TCP forwarding rules owned by this connection.
-    pub fn forward_routes(&self) -> Vec<(String, String)> { self.inner.forward_routes() }
+    pub fn forward_routes(&self) -> Vec<(String, String)> {
+        self.inner.forward_routes()
+    }
     /// Stops a local TCP forwarding rule and returns whether it existed.
-    pub fn remove_forward(&self, local: &str) -> bool { self.inner.remove_forward(local) }
+    pub fn remove_forward(&self, local: &str) -> bool {
+        self.inner.remove_forward(local)
+    }
     /// Returns reverse routes registered on this device.
-    pub fn reverse_routes(&self) -> Result<Vec<(String, String)>> { self.inner.reverse_routes() }
+    pub fn reverse_routes(&self) -> Result<Vec<(String, String)>> {
+        self.inner.reverse_routes()
+    }
     /// Removes all reverse routes registered by this client.
-    pub fn remove_all_reverse_routes(&self) -> Result<()> { self.inner.remove_all_reverse_routes() }
+    pub fn remove_all_reverse_routes(&self) -> Result<()> {
+        self.inner.remove_all_reverse_routes()
+    }
     /// Requests an adbd restart with root privileges.
-    pub fn root(&self) -> Result<()> { self.inner.root() }
+    pub fn root(&self) -> Result<()> {
+        self.inner.root()
+    }
     /// Requests a remount of writable partitions.
-    pub fn remount(&self) -> Result<()> { self.inner.remount() }
+    pub fn remount(&self) -> Result<()> {
+        self.inner.remount()
+    }
+    /// Requests that adbd listens for direct TCP ADB connections on `port`.
+    pub fn tcpip(&self, port: u16) -> Result<()> {
+        self.inner.tcpip(port)
+    }
     /// Whether the USB reader is still connected.
-    pub fn is_alive(&self) -> bool { self.inner.is_alive() }
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
 
     /// Downloads a file through the shared USB sync transport.
     pub fn pull(&self, path: &str, output: &mut dyn Write) -> Result<()> {

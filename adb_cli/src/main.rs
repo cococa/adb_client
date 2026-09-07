@@ -136,15 +136,18 @@ fn main() -> ExitCode {
         };
     }
     if (std::env::var_os("MACANDROIDBRIDGE_ADB_KEY").is_some()
-        && std::env::args().nth(1).as_deref() == Some("usb")
-        && !std::env::args().any(|arg| arg == "--list")) || std::env::args_os()
-        .next()
-        .and_then(|path| {
-            std::path::Path::new(&path)
-                .file_name()
-                .map(|name| name == "adb")
-        })
-        .unwrap_or(false)
+        // `adb_cli` is the App-facing executable. Every public command must
+        // use the self-contained compatibility layer, including `devices` and
+        // `mdns`; only the child relay retains the native `tcp` CLI parser.
+        && std::env::args().nth(1).as_deref() != Some("tcp"))
+        || std::env::args_os()
+            .next()
+            .and_then(|path| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|name| name == "adb" && std::env::args().nth(1).as_deref() != Some("tcp"))
+            })
+            .unwrap_or(false)
     {
         return compat::run();
     }

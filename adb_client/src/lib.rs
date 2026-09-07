@@ -40,3 +40,6 @@ pub use models::{
     ADBListItem, ADBListItemType, ADBStatExtendedResponse, ADBStatMapping, AdbStatResponse,
     HostFeatures, RebootType, RemountInfo,
 };
+
+/// Android 11+ wireless-debugging pairing support.
+pub mod wireless;

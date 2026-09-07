@@ -13,8 +13,8 @@ use std::{
     },
     path::PathBuf,
     process::{Command, Stdio},
-    thread,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -26,13 +26,13 @@ pub(crate) struct Context {
     pub product: u16,
 }
 
-
 pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Darwin sockaddr_un only permits roughly 104 bytes. App Support paths
     // routinely exceed that, so derive a short, per-key path in /private/tmp.
     // The socket is mode 0600 and its deterministic key hash keeps separate
     // sandbox identities from sharing a transport.
-    let hash = context.key
+    let hash = context
+        .key
         .as_os_str()
         .as_encoded_bytes()
         .iter()
@@ -42,12 +42,19 @@ pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::err
     let directory = std::env::temp_dir().join(format!("mab3-{hash:016x}"));
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    Ok(directory.join(format!("{:04x}{:04x}.sock", context.vendor, context.product)))
+    Ok(directory.join(format!(
+        "{:04x}{:04x}.sock",
+        context.vendor, context.product
+    )))
 }
 
 pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
     let socket = socket_path(context)?;
-    let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(socket.with_extension("lock"))?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(socket.with_extension("lock"))?;
     lock.lock()?;
     if let Ok(mut probe) = UnixStream::connect(&socket) {
         probe.write_all(&0u32.to_be_bytes())?;
@@ -70,7 +77,13 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         .env("ADB_CLI_PRODUCT", context.product.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(fs::OpenOptions::new().create(true).truncate(true).write(true).open(socket.with_extension("log"))?)
+        .stderr(
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(socket.with_extension("log"))?,
+        )
         .spawn()?;
     for _ in 0..80 {
         if UnixStream::connect(&socket).is_ok() {
@@ -78,10 +91,17 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err(format!("direct USB daemon did not become ready: {}", fs::read_to_string(socket.with_extension("log")).unwrap_or_default()).into())
+    Err(format!(
+        "direct USB daemon did not become ready: {}",
+        fs::read_to_string(socket.with_extension("log")).unwrap_or_default()
+    )
+    .into())
 }
 
-pub(crate) fn request(context: &Context, request: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn request(
+    context: &Context,
+    request: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     ensure_running(context)?;
     let mut stream = UnixStream::connect(socket_path(context)?)?;
     stream.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
@@ -98,11 +118,18 @@ pub(crate) fn request(context: &Context, request: &str) -> Result<String, Box<dy
     Ok(response.to_owned())
 }
 
-pub(crate) fn stream_request(context: &Context, request: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn stream_request(
+    context: &Context,
+    request: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     stream_request_to(context, request, &mut std::io::stdout().lock())
 }
 
-pub(crate) fn stream_request_to(context: &Context, request: &str, output: &mut dyn Write) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn stream_request_to(
+    context: &Context,
+    request: &str,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_running(context)?;
     let mut stream = UnixStream::connect(socket_path(context)?)?;
     stream.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
@@ -111,39 +138,59 @@ pub(crate) fn stream_request_to(context: &Context, request: &str, output: &mut d
     decode_stream(&mut BufReader::new(stream), output)
 }
 
-fn decode_stream(reader: &mut impl BufRead, output: &mut dyn Write) -> Result<(), Box<dyn std::error::Error>> {
+fn decode_stream(
+    reader: &mut impl BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut status = String::new();
     reader.read_line(&mut status)?;
-    if status != "OK\n" { return Err(status.into()); }
+    if status != "OK\n" {
+        return Err(status.into());
+    }
     loop {
         let mut length = [0; 4];
         reader.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if length == 0 { break; }
-        if length > 1024 * 1024 { return Err("oversized output frame".into()); }
+        if length == 0 {
+            break;
+        }
+        if length > 1024 * 1024 {
+            return Err("oversized output frame".into());
+        }
         let mut data = vec![0; length];
         reader.read_exact(&mut data)?;
         output.write_all(&data)?;
     }
     let mut result = String::new();
     reader.read_to_string(&mut result)?;
-    if result == "OK\n" { Ok(()) } else { Err(result.into()) }
+    if result == "OK\n" {
+        Ok(())
+    } else {
+        Err(result.into())
+    }
 }
 
 struct FramedWriter<'a>(&'a mut UnixStream);
 impl Write for FramedWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.is_empty() { return Ok(0); }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
         for chunk in bytes.chunks(64 * 1024) {
             self.0.write_all(&(chunk.len() as u32).to_be_bytes())?;
             self.0.write_all(chunk)?;
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
-fn stream_operation(stream: &mut UnixStream, operation: impl FnOnce(&mut dyn Write) -> adb_client::Result<()>) -> Result<(), Box<dyn std::error::Error>> {
+fn stream_operation(
+    stream: &mut UnixStream,
+    operation: impl FnOnce(&mut dyn Write) -> adb_client::Result<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(b"OK\n")?;
     let result = operation(&mut FramedWriter(stream));
     stream.write_all(&0u32.to_be_bytes())?;
@@ -158,7 +205,9 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The compatibility daemon bypasses clap's normal logger setup.
     let _ = env_logger::try_init();
     let context = Context {
-        key: std::env::var_os("MACANDROIDBRIDGE_ADB_KEY").map(PathBuf::from).ok_or("missing key")?,
+        key: std::env::var_os("MACANDROIDBRIDGE_ADB_KEY")
+            .map(PathBuf::from)
+            .ok_or("missing key")?,
         vendor: std::env::var("ADB_CLI_VENDOR")?.parse()?,
         product: std::env::var("ADB_CLI_PRODUCT")?.parse()?,
     };
@@ -166,7 +215,10 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     if socket.exists() {
         fs::remove_file(&socket)?;
     }
-    let device = Arc::new(ADBUSBDevice::new_with_custom_private_key(context.vendor, context.product, context.key)?.into_dispatched());
+    let device = Arc::new(
+        ADBUSBDevice::new_with_custom_private_key(context.vendor, context.product, context.key)?
+            .into_dispatched(),
+    );
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
@@ -188,7 +240,11 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 // Release USB after the app stops using us. Long-running shell
                 // requests hold another Arc, so active mirrors never time out.
-                if Arc::strong_count(&device) == 1 && last_request.elapsed() > Duration::from_secs(60) { break; }
+                if Arc::strong_count(&device) == 1
+                    && last_request.elapsed() > Duration::from_secs(60)
+                {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) => return Err(error.into()),
@@ -205,7 +261,9 @@ fn handle(
     let mut length = [0; 4];
     stream.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
-    if length > 1024 * 1024 { return Err("request exceeds 1 MiB".into()); }
+    if length > 1024 * 1024 {
+        return Err("request exceeds 1 MiB".into());
+    }
     let mut request = vec![0; length];
     stream.read_exact(&mut request)?;
     let request = String::from_utf8(request)?;
@@ -229,23 +287,41 @@ fn handle(
             let source = fields.next().ok_or("missing APK")?;
             let flags = fields.next().unwrap_or("");
             let user = fields.next().unwrap_or("");
-            if !flags.split_whitespace().all(|flag| matches!(flag, "-r" | "-g" | "-d")) {
+            if !flags
+                .split_whitespace()
+                .all(|flag| matches!(flag, "-r" | "-g" | "-d"))
+            {
                 return Err("unsupported install options".into());
             }
             if !user.is_empty() && !user.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("invalid install user".into());
             }
-            let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-            let remote = format!("/data/local/tmp/mab-install-{}-{suffix}.apk", std::process::id());
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let remote = format!(
+                "/data/local/tmp/mab-install-{}-{suffix}.apk",
+                std::process::id()
+            );
             let result = (|| -> adb_client::Result<()> {
                 let mut input = fs::File::open(source)?;
                 device.push(&mut input, &remote)?;
-                let user_flag = if user.is_empty() { String::new() } else { format!(" --user {user}") };
-                device.shell_command(&format!("pm install {flags}{user_flag} {remote}"), Some(&mut output))
+                let user_flag = if user.is_empty() {
+                    String::new()
+                } else {
+                    format!(" --user {user}")
+                };
+                device.shell_command(
+                    &format!("pm install {flags}{user_flag} {remote}"),
+                    Some(&mut output),
+                )
             })();
             let _ = device.shell_command(&format!("rm -f {remote}"), None);
             result?;
-            if !String::from_utf8_lossy(&output).lines().any(|line| line.trim() == "Success") {
+            if !String::from_utf8_lossy(&output)
+                .lines()
+                .any(|line| line.trim() == "Success")
+            {
                 return Err(String::from_utf8_lossy(&output).into_owned().into());
             }
         }
@@ -253,16 +329,30 @@ fn handle(
             let keep = fields.next().ok_or("missing uninstall option")?;
             let user = fields.next().ok_or("missing uninstall user")?;
             let package = fields.next().ok_or("missing package")?;
-            if (keep != "" && keep != "-k") || package.is_empty()
-                || !package.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_') {
+            if (keep != "" && keep != "-k")
+                || package.is_empty()
+                || !package
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+            {
                 return Err("invalid uninstall request".into());
             }
             if !user.is_empty() && !user.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("invalid uninstall user".into());
             }
-            let user_flag = if user.is_empty() { String::new() } else { format!(" --user {user}") };
-            device.shell_command(&format!("pm uninstall {keep}{user_flag} {package}"), Some(&mut output))?;
-            if !String::from_utf8_lossy(&output).lines().any(|line| line.trim() == "Success") {
+            let user_flag = if user.is_empty() {
+                String::new()
+            } else {
+                format!(" --user {user}")
+            };
+            device.shell_command(
+                &format!("pm uninstall {keep}{user_flag} {package}"),
+                Some(&mut output),
+            )?;
+            if !String::from_utf8_lossy(&output)
+                .lines()
+                .any(|line| line.trim() == "Success")
+            {
                 return Err(String::from_utf8_lossy(&output).into_owned().into());
             }
         }
@@ -291,8 +381,14 @@ fn handle(
             device.remove_all_reverse_routes()?;
         }
         "FORWARD" => {
-            let local = fields.next().ok_or("missing local forward endpoint")?.to_owned();
-            let remote = fields.next().ok_or("missing remote forward endpoint")?.to_owned();
+            let local = fields
+                .next()
+                .ok_or("missing local forward endpoint")?
+                .to_owned();
+            let remote = fields
+                .next()
+                .ok_or("missing remote forward endpoint")?
+                .to_owned();
             let device = Arc::clone(&device);
             let local_key = local.clone();
             let listener_device = Arc::clone(&device);
@@ -304,7 +400,11 @@ fn handle(
             // Do not acknowledge until the listener has completed bind; scrcpy
             // connects immediately after adb forward returns.
             for _ in 0..100 {
-                if device.forward_routes().iter().any(|(endpoint, _)| endpoint == &local_key) {
+                if device
+                    .forward_routes()
+                    .iter()
+                    .any(|(endpoint, _)| endpoint == &local_key)
+                {
                     stream.write_all(b"OK\n")?;
                     return Ok(());
                 }
@@ -319,13 +419,22 @@ fn handle(
         }
         "FORWARD_REMOVE" => {
             let local = fields.next().ok_or("missing local forward endpoint")?;
-            if !device.remove_forward(local) { return Err("forward rule not found".into()); }
+            if !device.remove_forward(local) {
+                return Err("forward rule not found".into());
+            }
         }
         "ROOT" => {
             device.root()?;
         }
         "REMOUNT" => {
             device.remount()?;
+        }
+        "TCPIP" => {
+            let port = fields.next().ok_or("missing TCP port")?.parse::<u16>()?;
+            if port == 0 {
+                return Err("TCP port must be between 1 and 65535".into());
+            }
+            device.tcpip(port)?;
         }
         "DEVICE_INFO" => {
             for property in ["ro.serialno", "ro.product.model", "ro.build.product"] {
@@ -348,10 +457,16 @@ mod tests {
     #[test]
     fn large_binary_stream_applies_backpressure_without_truncation() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
-        let bytes: Vec<u8> = (0..2 * 1024 * 1024).map(|index| (index % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect();
         let expected = bytes.clone();
         let writer = thread::spawn(move || {
-            stream_operation(&mut sender, |output| { output.write_all(&bytes)?; Ok(()) }).unwrap();
+            stream_operation(&mut sender, |output| {
+                output.write_all(&bytes)?;
+                Ok(())
+            })
+            .unwrap();
         });
         let mut actual = Vec::new();
         decode_stream(&mut BufReader::new(receiver), &mut actual).unwrap();
