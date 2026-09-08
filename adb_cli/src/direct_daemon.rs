@@ -8,7 +8,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
-        fs::PermissionsExt,
+        fs::{OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
@@ -41,25 +41,24 @@ impl Drop for ActiveRequest {
 }
 
 pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Darwin sockaddr_un only permits roughly 104 bytes. App Support paths
-    // routinely exceed that, so derive a short, per-key path in /private/tmp.
-    // The socket is mode 0600 and its deterministic key hash keeps separate
-    // sandbox identities from sharing a transport.
-    let hash = context
-        .key
-        .as_os_str()
-        .as_encoded_bytes()
+    // App Sandbox expands TMPDIR to a long container path, while Darwin
+    // sockaddr_un only permits roughly 104 bytes. Hash the complete transport
+    // identity into one filename directly below TMPDIR so the location ID does
+    // not make the socket path exceed SUN_LEN.
+    let identity = format!(
+        "{}\0{:04x}:{:04x}:{:016x}",
+        context.key.display(),
+        context.vendor,
+        context.product,
+        context.location
+    );
+    let hash = identity
+        .as_bytes()
         .iter()
         .fold(0xcbf2_9ce4_8422_2325u64, |value, byte| {
             (value ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-    let directory = std::env::temp_dir().join(format!("mab3-{hash:016x}"));
-    fs::create_dir_all(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    Ok(directory.join(format!(
-        "{:04x}{:04x}-{:016x}.sock",
-        context.vendor, context.product, context.location
-    )))
+    Ok(std::env::temp_dir().join(format!("mab3-{hash:016x}.sock")))
 }
 
 pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
@@ -68,6 +67,7 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
         .open(socket.with_extension("lock"))?;
     lock.lock()?;
     if let Ok(mut probe) = UnixStream::connect(&socket) {
@@ -301,12 +301,22 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             context.product,
             context.location,
             context.key,
-        )?
+        )
+        .map_err(|error| format!("USB connect/authenticate failed: {error}"))?
         .into_dispatched(),
     );
-    let listener = UnixListener::bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
+    let listener = UnixListener::bind(&socket).map_err(|error| {
+        format!(
+            "control socket bind failed ({} bytes, {}): {error}",
+            socket.as_os_str().as_encoded_bytes().len(),
+            socket.display()
+        )
+    })?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("control socket permissions failed: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("control socket nonblocking setup failed: {error}"))?;
     let mut last_request = Instant::now();
     let active_requests = Arc::new(AtomicUsize::new(0));
     while device.is_alive() {
@@ -314,9 +324,17 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok((mut stream, _)) => {
                 // Darwin accepts inherit O_NONBLOCK from the listener. Service
                 // streams need blocking backpressure for large binary downloads.
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("accepted socket blocking setup failed: {error}"))?;
+                // Darwin rejects SO_RCVTIMEO/SO_SNDTIMEO on AF_UNIX sockets
+                // with EINVAL. The USB transport itself retains its I/O
+                // deadlines; only apply socket timeouts on supported hosts.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+                }
                 last_request = Instant::now();
                 let active = Arc::clone(&active_requests);
                 let reserved = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {

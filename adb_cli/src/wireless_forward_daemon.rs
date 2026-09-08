@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::SocketAddr,
     os::unix::{
-        fs::PermissionsExt,
+        fs::{OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -31,10 +31,7 @@ fn hash_bytes<'a>(bytes: impl Iterator<Item = &'a u8>) -> u64 {
 fn socket_path(context: &Context<'_>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let identity = format!("{}\0{}", context.key.display(), context.address);
     let hash = hash_bytes(identity.as_bytes().iter());
-    let directory = std::env::temp_dir().join(format!("mab3-wifi-{hash:016x}"));
-    fs::create_dir_all(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    Ok(directory.join("forward.sock"))
+    Ok(std::env::temp_dir().join(format!("mabw-{hash:016x}.sock")))
 }
 
 fn ensure_running(context: &Context<'_>) -> Result<(), Box<dyn std::error::Error>> {
@@ -43,6 +40,7 @@ fn ensure_running(context: &Context<'_>) -> Result<(), Box<dyn std::error::Error
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
         .open(socket.with_extension("lock"))?;
     lock.lock()?;
     if request_once(&socket, "PING").is_ok() {
@@ -88,8 +86,12 @@ pub(crate) fn request(
 
 fn request_once(socket: &Path, request: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    // macOS returns EINVAL for SO_RCVTIMEO/SO_SNDTIMEO on AF_UNIX.
+    #[cfg(not(target_os = "macos"))]
+    {
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    }
     stream.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
     stream.write_all(request.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -121,8 +123,11 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                }
                 last_request = Instant::now();
                 let device = Arc::clone(&device);
                 thread::spawn(move || {
