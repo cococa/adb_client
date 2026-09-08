@@ -13,7 +13,10 @@ use std::{
     },
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,6 +27,17 @@ pub(crate) struct Context {
     pub key: PathBuf,
     pub vendor: u16,
     pub product: u16,
+    pub location: u64,
+}
+
+const MAX_CONCURRENT_REQUESTS: usize = 12;
+
+struct ActiveRequest(Arc<AtomicUsize>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -43,8 +57,8 @@ pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::err
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     Ok(directory.join(format!(
-        "{:04x}{:04x}.sock",
-        context.vendor, context.product
+        "{:04x}{:04x}-{:016x}.sock",
+        context.vendor, context.product, context.location
     )))
 }
 
@@ -75,6 +89,7 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         .env("MACANDROIDBRIDGE_ADB_KEY", &context.key)
         .env("ADB_CLI_VENDOR", context.vendor.to_string())
         .env("ADB_CLI_PRODUCT", context.product.to_string())
+        .env("ADB_CLI_LOCATION", context.location.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(
@@ -187,6 +202,70 @@ impl Write for FramedWriter<'_> {
     }
 }
 
+struct FramedReader<'a> {
+    stream: &'a mut UnixStream,
+    frame: Vec<u8>,
+    offset: usize,
+    finished: bool,
+}
+
+impl<'a> FramedReader<'a> {
+    fn new(stream: &'a mut UnixStream) -> Self {
+        Self {
+            stream,
+            frame: Vec::new(),
+            offset: 0,
+            finished: false,
+        }
+    }
+}
+
+impl Read for FramedReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.frame.len() && !self.finished {
+            let mut length = [0; 4];
+            self.stream.read_exact(&mut length)?;
+            let length = u32::from_be_bytes(length) as usize;
+            if length == 0 {
+                self.finished = true;
+                return Ok(0);
+            }
+            if length > 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "oversized input frame",
+                ));
+            }
+            self.frame.resize(length, 0);
+            self.stream.read_exact(&mut self.frame)?;
+            self.offset = 0;
+        }
+        if self.finished {
+            return Ok(0);
+        }
+        let count = output.len().min(self.frame.len() - self.offset);
+        output[..count].copy_from_slice(&self.frame[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+fn input_stream_operation(
+    stream: &mut UnixStream,
+    operation: impl FnOnce(&mut dyn Read) -> adb_client::Result<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stream.write_all(b"OK\n")?;
+    let result = operation(&mut FramedReader::new(stream));
+    match result {
+        Ok(()) => stream.write_all(b"OK\n")?,
+        Err(error) => writeln!(stream, "ERR\t{error}")?,
+    }
+    Ok(())
+}
+
 fn stream_operation(
     stream: &mut UnixStream,
     operation: impl FnOnce(&mut dyn Write) -> adb_client::Result<()>,
@@ -210,28 +289,46 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("missing key")?,
         vendor: std::env::var("ADB_CLI_VENDOR")?.parse()?,
         product: std::env::var("ADB_CLI_PRODUCT")?.parse()?,
+        location: std::env::var("ADB_CLI_LOCATION")?.parse()?,
     };
     let socket = socket_path(&context)?;
     if socket.exists() {
         fs::remove_file(&socket)?;
     }
     let device = Arc::new(
-        ADBUSBDevice::new_with_custom_private_key(context.vendor, context.product, context.key)?
-            .into_dispatched(),
+        ADBUSBDevice::new_with_custom_private_key_at_location(
+            context.vendor,
+            context.product,
+            context.location,
+            context.key,
+        )?
+        .into_dispatched(),
     );
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let mut last_request = Instant::now();
+    let active_requests = Arc::new(AtomicUsize::new(0));
     while device.is_alive() {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 // Darwin accepts inherit O_NONBLOCK from the listener. Service
                 // streams need blocking backpressure for large binary downloads.
                 stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                 last_request = Instant::now();
+                let active = Arc::clone(&active_requests);
+                let reserved = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < MAX_CONCURRENT_REQUESTS).then_some(count + 1)
+                });
+                if reserved.is_err() {
+                    let _ = stream.write_all(b"ERR\ttoo many concurrent requests\n");
+                    continue;
+                }
                 let device = Arc::clone(&device);
                 thread::spawn(move || {
+                    let _active_request = ActiveRequest(active);
                     if let Err(error) = handle(device, &mut stream) {
                         let _ = writeln!(stream, "ERR\t{error}");
                     }
@@ -363,6 +460,10 @@ fn handle(
             let mut input = fs::File::open(source)?;
             device.push(&mut input, destination)?;
         }
+        "PUSH_STREAM" => {
+            let destination = fields.next().ok_or("missing push destination")?;
+            return input_stream_operation(stream, |input| device.push(input, destination));
+        }
         "REVERSE" => {
             let remote = fields.next().ok_or("missing reverse remote")?;
             let local = fields.next().ok_or("missing reverse local")?;
@@ -390,27 +491,16 @@ fn handle(
                 .ok_or("missing remote forward endpoint")?
                 .to_owned();
             let device = Arc::clone(&device);
-            let local_key = local.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let listener_device = Arc::clone(&device);
             std::thread::spawn(move || {
-                if let Err(error) = listener_device.serve_forward(local, remote) {
+                if let Err(error) = listener_device.serve_forward_ready(local, remote, ready_tx) {
                     log::debug!("ADB forward listener ended: {error}");
                 }
             });
-            // Do not acknowledge until the listener has completed bind; scrcpy
-            // connects immediately after adb forward returns.
-            for _ in 0..100 {
-                if device
-                    .forward_routes()
-                    .iter()
-                    .any(|(endpoint, _)| endpoint == &local_key)
-                {
-                    stream.write_all(b"OK\n")?;
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            return Err("forward listener did not become ready".into());
+            ready_rx.recv_timeout(Duration::from_secs(2))??;
+            stream.write_all(b"OK\n")?;
+            return Ok(());
         }
         "FORWARD_LIST" => {
             for (local, remote) in device.forward_routes() {
@@ -422,6 +512,9 @@ fn handle(
             if !device.remove_forward(local) {
                 return Err("forward rule not found".into());
             }
+        }
+        "FORWARD_REMOVE_ALL" => {
+            device.remove_all_forwards();
         }
         "ROOT" => {
             device.root()?;
@@ -488,5 +581,36 @@ mod tests {
         assert_eq!(output, bytes);
         framed.extend_from_slice(b"ERR\tremote failed\n");
         assert!(decode_stream(&mut std::io::Cursor::new(framed), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn framed_upload_preserves_bytes_and_acknowledges_completion() {
+        let (mut client, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut input = Vec::new();
+            input_stream_operation(&mut server_stream, |reader| {
+                reader.read_to_end(&mut input)?;
+                Ok(())
+            })
+            .unwrap();
+            input
+        });
+
+        let mut ready = [0; 3];
+        client.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"OK\n");
+        for frame in [b"first".as_slice(), &[0, 255, 42]] {
+            client
+                .write_all(&(frame.len() as u32).to_be_bytes())
+                .unwrap();
+            client.write_all(frame).unwrap();
+        }
+        client.write_all(&0u32.to_be_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut terminal = String::new();
+        client.read_to_string(&mut terminal).unwrap();
+
+        assert_eq!(terminal, "OK\n");
+        assert_eq!(server.join().unwrap(), b"first\0\xff*");
     }
 }

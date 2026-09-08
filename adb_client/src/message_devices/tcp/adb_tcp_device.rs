@@ -3,6 +3,7 @@ use std::path::Path;
 use std::{io::Read, net::SocketAddr};
 
 use crate::message_devices::adb_message_device::ADBMessageDevice;
+use crate::message_devices::dispatched_device::DispatchedADBMessageDevice;
 use crate::models::RemountInfo;
 use crate::tcp::tcp_transport::TcpTransport;
 use crate::utils::get_default_adb_key_path;
@@ -12,6 +13,12 @@ use crate::{ADBDeviceExt, ADBListItemType, Result};
 #[derive(Debug)]
 pub struct ADBTcpDevice {
     inner: ADBMessageDevice<TcpTransport>,
+}
+
+/// A wireless ADB device whose packets are routed by one shared dispatcher.
+#[derive(Debug)]
+pub struct ADBDispatchedTCPDevice {
+    inner: DispatchedADBMessageDevice,
 }
 
 impl ADBTcpDevice {
@@ -31,6 +38,75 @@ impl ADBTcpDevice {
                 private_key_path,
             )?,
         })
+    }
+
+    /// Transfers this authenticated wireless connection to a packet dispatcher.
+    #[must_use]
+    pub fn into_dispatched(self) -> ADBDispatchedTCPDevice {
+        ADBDispatchedTCPDevice {
+            inner: self.inner.into_dispatched(),
+        }
+    }
+}
+
+impl ADBDispatchedTCPDevice {
+    /// Runs a shell-v2 command and propagates the remote exit status.
+    pub fn shell_command(
+        &self,
+        command: &str,
+        output: Option<&mut dyn std::io::Write>,
+    ) -> Result<()> {
+        self.inner.shell_command(command, output)
+    }
+
+    /// Uploads a file through the authenticated dispatcher.
+    pub fn push<R: std::io::Read>(&self, input: R, path: &str) -> Result<()> {
+        self.inner.push(input, path)
+    }
+
+    /// Downloads a file through the authenticated dispatcher.
+    pub fn pull(&self, path: &str, output: &mut dyn std::io::Write) -> Result<()> {
+        self.inner.pull(path, output)
+    }
+    /// Serves a local TCP port and forwards accepted connections to `remote`.
+    pub fn serve_forward(self: std::sync::Arc<Self>, local: String, remote: String) -> Result<()> {
+        self.inner.serve_forward(local, remote, None)
+    }
+
+    /// Signals successful listener binding before serving connections.
+    pub fn serve_forward_ready(
+        self: std::sync::Arc<Self>,
+        local: String,
+        remote: String,
+        ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        let result = self.inner.serve_forward(local, remote, Some(&ready));
+        if let Err(error) = &result {
+            let _ = ready.send(Err(error.to_string()));
+        }
+        result
+    }
+
+    /// Lists local-to-remote forwarding rules owned by this connection.
+    #[must_use]
+    pub fn forward_routes(&self) -> Vec<(String, String)> {
+        self.inner.forward_routes()
+    }
+
+    /// Stops one local forwarding rule.
+    pub fn remove_forward(&self, local: &str) -> bool {
+        self.inner.remove_forward(local)
+    }
+
+    /// Stops all local forwarding rules.
+    pub fn remove_all_forwards(&self) -> usize {
+        self.inner.remove_all_forwards()
+    }
+
+    /// Whether the wireless transport remains connected.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
     }
 }
 

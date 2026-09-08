@@ -15,6 +15,7 @@ typedef struct {
 typedef struct {
     uint16_t vendor_id;
     uint16_t product_id;
+    uint64_t location_id;
 } macadb_device_info;
 
 static int property_u16(io_registry_entry_t service, CFStringRef key, UInt16 *value) {
@@ -26,6 +27,32 @@ static int property_u16(io_registry_entry_t service, CFStringRef key, UInt16 *va
         && CFNumberGetValue((CFNumberRef)property, kCFNumberSInt16Type, value);
     CFRelease(property);
     return ok;
+}
+
+static int property_u32(io_registry_entry_t service, CFStringRef key, UInt32 *value) {
+    CFTypeRef property = IORegistryEntrySearchCFProperty(
+        service, kIOServicePlane, key, kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (!property) return 0;
+    int ok = CFGetTypeID(property) == CFNumberGetTypeID()
+        && CFNumberGetValue((CFNumberRef)property, kCFNumberSInt32Type, value);
+    CFRelease(property);
+    return ok;
+}
+
+// locationID identifies the physical USB topology (hub/port path) and remains
+// stable while a phone stays on that port. Registry entry ID is a per-attach
+// fallback for unusual devices whose IORegistry tree omits locationID.
+static uint64_t device_location_id(io_registry_entry_t service) {
+    UInt32 location = 0;
+    if (property_u32(service, CFSTR("locationID"), &location) && location != 0) {
+        return location;
+    }
+    uint64_t registry_id = 0;
+    if (IORegistryEntryGetRegistryEntryID(service, &registry_id) == kIOReturnSuccess) {
+        return registry_id | (UINT64_C(1) << 63);
+    }
+    return 0;
 }
 
 // nusb can enumerate a composite Android device on macOS without retaining its
@@ -44,6 +71,7 @@ int macadb_list(macadb_device_info **output, size_t *count) {
     io_service_t service;
     while ((service = IOIteratorNext(iterator))) {
         UInt16 vendor = 0, product = 0;
+        uint64_t location = device_location_id(service);
         UInt16 klass = 0, subclass = 0, protocol = 0;
         int is_adb = property_u16(service, CFSTR("bInterfaceClass"), &klass)
             && property_u16(service, CFSTR("bInterfaceSubClass"), &subclass)
@@ -56,7 +84,7 @@ int macadb_list(macadb_device_info **output, size_t *count) {
 
         int duplicate = 0;
         for (size_t index = 0; index < *count; index++) {
-            if (devices[index].vendor_id == vendor && devices[index].product_id == product) {
+            if (location != 0 && devices[index].location_id == location) {
                 duplicate = 1;
                 break;
             }
@@ -73,7 +101,7 @@ int macadb_list(macadb_device_info **output, size_t *count) {
             devices = next;
             capacity = next_capacity;
         }
-        devices[*count] = (macadb_device_info) { vendor, product };
+        devices[*count] = (macadb_device_info) { vendor, product, location };
         *count += 1;
     }
     IOObjectRelease(iterator);
@@ -83,7 +111,8 @@ int macadb_list(macadb_device_info **output, size_t *count) {
 
 void macadb_list_free(macadb_device_info *devices) { free(devices); }
 
-int macadb_open(uint16_t wanted_vendor, uint16_t wanted_product, macadb_interface **output) {
+int macadb_open(uint16_t wanted_vendor, uint16_t wanted_product,
+        uint64_t wanted_location, macadb_interface **output) {
     *output = NULL;
     CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBInterfaceClassName);
     io_iterator_t iterator = 0;
@@ -94,9 +123,11 @@ int macadb_open(uint16_t wanted_vendor, uint16_t wanted_product, macadb_interfac
     io_service_t service;
     while ((service = IOIteratorNext(iterator))) {
         UInt16 vendor = 0, product = 0;
+        uint64_t location = device_location_id(service);
         if (!property_u16(service, CFSTR("idVendor"), &vendor)
             || !property_u16(service, CFSTR("idProduct"), &product)
-            || vendor != wanted_vendor || product != wanted_product) {
+            || vendor != wanted_vendor || product != wanted_product
+            || (wanted_location != 0 && location != wanted_location)) {
             IOObjectRelease(service);
             continue;
         }

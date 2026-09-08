@@ -146,25 +146,37 @@ impl ADBMessageTransport for TcpTransport {
         raw_connection.set_read_timeout(read_timeout)?;
 
         let mut data = [0; 24];
-        let mut total_read = 0;
-        loop {
-            total_read += raw_connection.read(&mut data[total_read..])?;
-            if total_read == data.len() {
-                break;
-            }
+        let first = raw_connection.read(&mut data)?;
+        if first == 0 {
+            return Err(RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "wireless ADB transport closed",
+            )));
+        }
+        // A short dispatcher timeout only applies while waiting for the first
+        // header byte. Once a packet starts, finish it with a bounded but
+        // realistic network timeout so a partial TLS/TCP read cannot desync
+        // the ADB framing.
+        raw_connection.set_read_timeout(Duration::from_secs(5))?;
+        if first < data.len() {
+            raw_connection
+                .read_exact(&mut data[first..])
+                .map_err(|error| {
+                    RustADBError::ADBRequestFailed(format!(
+                        "incomplete wireless ADB packet header: {error}"
+                    ))
+                })?;
         }
 
         let header = ADBTransportMessageHeader::try_from(data)?;
 
         if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
-            let mut total_read = 0;
-            loop {
-                total_read += raw_connection.read(&mut msg_data[total_read..])?;
-                if total_read == msg_data.len() {
-                    break;
-                }
-            }
+            raw_connection.read_exact(&mut msg_data).map_err(|error| {
+                RustADBError::ADBRequestFailed(format!(
+                    "incomplete wireless ADB packet payload: {error}"
+                ))
+            })?;
 
             let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
 
@@ -192,27 +204,13 @@ impl ADBMessageTransport for TcpTransport {
         let mut raw_connection = raw_connection_lock.lock()?;
         raw_connection.set_write_timeout(write_timeout)?;
 
-        let mut total_written = 0;
-        loop {
-            total_written += raw_connection.write(&message_bytes[total_written..])?;
-            if total_written == message_bytes.len() {
-                raw_connection.flush()?;
-                break;
-            }
-        }
+        raw_connection.write_all(&message_bytes)?;
 
         let payload = message.into_payload();
         if !payload.is_empty() {
-            let mut total_written = 0;
-            loop {
-                total_written += raw_connection.write(&payload[total_written..])?;
-                if total_written == payload.len() {
-                    raw_connection.flush()?;
-                    drop(raw_connection);
-                    break;
-                }
-            }
+            raw_connection.write_all(&payload)?;
         }
+        raw_connection.flush()?;
 
         Ok(())
     }

@@ -1,6 +1,5 @@
 //! ADB services backed by [`TransportDispatcher`].
 
-use rand::RngExt;
 use std::{
     collections::HashMap,
     collections::VecDeque,
@@ -32,6 +31,88 @@ pub(crate) struct DispatchedADBMessageDevice {
     forwards: Arc<Mutex<HashMap<String, (String, Arc<AtomicBool>)>>>,
 }
 
+struct ForwardReaderStop(Arc<AtomicBool>);
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    #[derive(Clone, Debug)]
+    struct IdleTransport;
+    impl crate::adb_transport::ADBTransport for IdleTransport {
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl ADBMessageTransport for IdleTransport {
+        fn read_message_with_timeout(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> Result<ADBTransportMessage> {
+            std::thread::sleep(timeout);
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+        }
+        fn write_message_with_timeout(
+            &mut self,
+            _: ADBTransportMessage,
+            _: std::time::Duration,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn forward_readiness_conflicts_and_removal() {
+        let device = Arc::new(DispatchedADBMessageDevice::new(IdleTransport));
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let local = format!("tcp:{}", reservation.local_addr().unwrap().port());
+        assert!(
+            device
+                .serve_forward(local.clone(), "tcp:80".into(), None)
+                .is_err()
+        );
+        assert!(device.forward_routes().is_empty());
+        drop(reservation);
+        let (tx, rx) = mpsc::channel();
+        let child = Arc::clone(&device);
+        let endpoint = local.clone();
+        let listener =
+            std::thread::spawn(move || child.serve_forward(endpoint, "tcp:80".into(), Some(&tx)));
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(
+            device
+                .serve_forward(local.clone(), "tcp:81".into(), None)
+                .is_err()
+        );
+        assert_eq!(
+            device.forward_routes(),
+            vec![(local.clone(), "tcp:80".into())]
+        );
+        assert!(device.remove_forward(&local));
+        listener.join().unwrap().unwrap();
+        assert!(device.forward_routes().is_empty());
+        let (tx, rx) = mpsc::channel();
+        let child = Arc::clone(&device);
+        let listener =
+            std::thread::spawn(move || child.serve_forward(local, "tcp:82".into(), Some(&tx)));
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(device.remove_all_forwards(), 1);
+        listener.join().unwrap().unwrap();
+    }
+}
+
+impl Drop for ForwardReaderStop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 impl DispatchedADBMessageDevice {
     pub(crate) fn new<T: ADBMessageTransport>(transport: T) -> Self {
         Self {
@@ -41,10 +122,9 @@ impl DispatchedADBMessageDevice {
     }
 
     fn open_session(&self, command: &ADBLocalCommand) -> Result<DispatchedService> {
-        let mut rng = rand::rng();
-        let local_id: u32 = rng.random();
         // Register before OPEN so an immediate OKAY can never be lost.
-        let session = self.dispatcher.register(local_id)?;
+        let session = self.dispatcher.register()?;
+        let local_id = session.local_id();
         let mut destination = command.to_string().into_bytes();
         if !destination.ends_with(&[0]) {
             destination.push(0);
@@ -70,9 +150,8 @@ impl DispatchedADBMessageDevice {
     }
 
     fn open_destination(&self, destination: &str) -> Result<DispatchedService> {
-        let mut rng = rand::rng();
-        let local_id: u32 = rng.random();
-        let session = self.dispatcher.register(local_id)?;
+        let session = self.dispatcher.register()?;
+        let local_id = session.local_id();
         let mut payload = destination.as_bytes().to_vec();
         payload.push(0);
         session.send(ADBTransportMessage::try_new(
@@ -97,18 +176,30 @@ impl DispatchedADBMessageDevice {
 
     /// Serves a local TCP listener and forwards each accepted connection to an
     /// Android ADB destination such as `tcp:5555`.
-    pub(crate) fn serve_forward(&self, local: String, remote: String) -> Result<()> {
+    pub(crate) fn serve_forward(
+        &self,
+        local: String,
+        remote: String,
+        ready: Option<&std::sync::mpsc::Sender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
         let port = local
             .strip_prefix("tcp:")
             .and_then(|value| value.parse::<u16>().ok())
             .ok_or_else(|| RustADBError::ADBRequestFailed("forward requires tcp:<port>".into()))?;
+        let mut routes = self.forwards.lock().unwrap();
+        if port == 0 || routes.contains_key(&local) {
+            return Err(RustADBError::ADBRequestFailed(
+                "forward requires an unused nonzero TCP port".into(),
+            ));
+        }
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
-        self.forwards
-            .lock()
-            .unwrap()
-            .insert(local.clone(), (remote.clone(), Arc::clone(&stop)));
+        routes.insert(local.clone(), (remote.clone(), Arc::clone(&stop)));
+        drop(routes);
+        if let Some(ready) = ready {
+            let _ = ready.send(Ok(()));
+        }
         std::thread::scope(|scope| -> Result<()> {
             for incoming in listener.incoming() {
                 if stop.load(Ordering::Acquire) {
@@ -132,7 +223,13 @@ impl DispatchedADBMessageDevice {
             }
             Ok(())
         })?;
-        self.forwards.lock().unwrap().remove(&local);
+        let mut routes = self.forwards.lock().unwrap();
+        if routes
+            .get(&local)
+            .is_some_and(|(_, flag)| Arc::ptr_eq(flag, &stop))
+        {
+            routes.remove(&local);
+        }
         Ok(())
     }
 
@@ -157,17 +254,43 @@ impl DispatchedADBMessageDevice {
             .unwrap_or(false)
     }
 
+    pub(crate) fn remove_all_forwards(&self) -> usize {
+        let mut forwards = self.forwards.lock().unwrap();
+        let count = forwards.len();
+        for (_, (_, stop)) in forwards.drain() {
+            stop.store(true, Ordering::Release);
+        }
+        count
+    }
+
     fn forward_connection(&self, mut socket: TcpStream, remote: &str) -> Result<()> {
         socket.set_nodelay(true)?;
-        socket.set_read_timeout(Some(std::time::Duration::from_millis(10)))?;
+        socket.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
         let service = self.open_destination(remote)?;
-        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+        // Keep this bounded: if adbd is waiting for an OKAY, TCP naturally
+        // applies backpressure instead of letting a fast local producer grow
+        // an unbounded memory queue.
+        let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(16);
         let mut reader = socket.try_clone()?;
+        let reader_running = Arc::new(AtomicBool::new(true));
+        let _reader_stop = ForwardReaderStop(Arc::clone(&reader_running));
         std::thread::spawn(move || {
             let mut buffer = vec![0; 64 * 1024];
-            loop {
+            while reader_running.load(Ordering::Acquire) {
                 match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
+                        let _ = tx.send(None);
+                        return;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => {
                         let _ = tx.send(None);
                         return;
                     }
@@ -178,22 +301,28 @@ impl DispatchedADBMessageDevice {
         });
         let mut pending = false;
         loop {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    None => {
-                        let _ = service.close_ack();
-                        return Ok(());
-                    }
-                    Some(payload) if !pending => {
-                        service.session.send(ADBTransportMessage::try_new(
-                            MessageCommand::Write,
-                            service.session.local_id(),
-                            service.remote_id,
-                            &payload,
-                        )?)?;
-                        pending = true;
-                    }
-                    Some(_) => {}
+            // ADB permits one outstanding host WRTE per service. Do not drain
+            // the queue while that WRTE is awaiting its OKAY: doing so would
+            // silently discard forward data under load.
+            if !pending {
+                match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                    Ok(event) => match event {
+                        None => {
+                            let _ = service.close_ack();
+                            return Ok(());
+                        }
+                        Some(payload) => {
+                            service.session.send(ADBTransportMessage::try_new(
+                                MessageCommand::Write,
+                                service.session.local_id(),
+                                service.remote_id,
+                                &payload,
+                            )?)?;
+                            pending = true;
+                        }
+                    },
                 }
             }
             match service

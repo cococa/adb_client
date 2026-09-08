@@ -3,7 +3,9 @@ use std::{
     time::Duration,
 };
 
-use nusb::{DeviceInfo, MaybeFuture};
+use nusb::DeviceInfo;
+#[cfg(not(target_os = "macos"))]
+use nusb::MaybeFuture;
 
 use super::utils::is_adb_device;
 use crate::{
@@ -27,7 +29,12 @@ mod macos_iokit {
         _private: [u8; 0],
     }
     unsafe extern "C" {
-        pub fn macadb_open(vendor_id: u16, product_id: u16, output: *mut *mut Handle) -> i32;
+        pub fn macadb_open(
+            vendor_id: u16,
+            product_id: u16,
+            location_id: u64,
+            output: *mut *mut Handle,
+        ) -> i32;
         pub fn macadb_read(
             handle: *mut Handle,
             buffer: *mut c_void,
@@ -63,6 +70,7 @@ impl Drop for MacOSConnection {
 pub struct USBTransport {
     vendor_id: u16,
     product_id: u16,
+    location_id: u64,
     #[cfg(target_os = "macos")]
     connection: Option<Arc<Mutex<MacOSConnection>>>,
 }
@@ -72,6 +80,7 @@ impl Clone for USBTransport {
         Self {
             vendor_id: self.vendor_id,
             product_id: self.product_id,
+            location_id: self.location_id,
             #[cfg(target_os = "macos")]
             connection: self.connection.clone(),
         }
@@ -82,6 +91,7 @@ impl std::fmt::Debug for USBTransport {
         f.debug_struct("USBTransport")
             .field("vendor_id", &format_args!("{:04x}", self.vendor_id))
             .field("product_id", &format_args!("{:04x}", self.product_id))
+            .field("location_id", &format_args!("{:016x}", self.location_id))
             .field("connected", &self.is_connected())
             .finish()
     }
@@ -90,6 +100,11 @@ impl std::fmt::Debug for USBTransport {
 impl USBTransport {
     /// Creates a transport for a discovered ADB USB device.
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
+        Self::new_at_location(vendor_id, product_id, 0)
+    }
+
+    /// Creates a transport pinned to one physical macOS USB location.
+    pub fn new_at_location(vendor_id: u16, product_id: u16, location_id: u64) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             // Discovery and open both use the native IOKit interface API.
@@ -98,21 +113,22 @@ impl USBTransport {
             return Ok(Self {
                 vendor_id,
                 product_id,
+                location_id,
                 connection: None,
             });
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-        let device_info = nusb::list_devices()
-            .wait()?
-            .find(|device| {
-                device.vendor_id() == vendor_id
-                    && device.product_id() == product_id
-                    && is_adb_device(device)
-            })
-            .ok_or(RustADBError::USBDeviceNotFound(vendor_id, product_id))?;
-        Self::new_from_device(device_info)
+            let device_info = nusb::list_devices()
+                .wait()?
+                .find(|device| {
+                    device.vendor_id() == vendor_id
+                        && device.product_id() == product_id
+                        && is_adb_device(device)
+                })
+                .ok_or(RustADBError::USBDeviceNotFound(vendor_id, product_id))?;
+            Self::new_from_device(device_info)
         }
     }
     /// Creates a transport from a device returned by USB discovery.
@@ -123,6 +139,7 @@ impl USBTransport {
         Ok(Self {
             vendor_id: device_info.vendor_id(),
             product_id: device_info.product_id(),
+            location_id: 0,
             #[cfg(target_os = "macos")]
             connection: None,
         })
@@ -235,17 +252,24 @@ impl ADBTransport for USBTransport {
                 return Ok(());
             }
             let mut handle = std::ptr::null_mut();
-            let result =
-                unsafe { macos_iokit::macadb_open(self.vendor_id, self.product_id, &mut handle) };
+            let result = unsafe {
+                macos_iokit::macadb_open(
+                    self.vendor_id,
+                    self.product_id,
+                    self.location_id,
+                    &mut handle,
+                )
+            };
             if result != 0 || handle.is_null() {
                 return Err(Self::iokit_error("open", result));
             }
             let max_packet_size = unsafe { macos_iokit::macadb_max_packet_size(handle) } as usize;
             self.connection = Some(Arc::new(Mutex::new(MacOSConnection { handle })));
             log::debug!(
-                "opened ADB USB interface for {:04x}:{:04x} (max packet size {max_packet_size})",
+                "opened ADB USB interface for {:04x}:{:04x}@{:016x} (max packet size {max_packet_size})",
                 self.vendor_id,
-                self.product_id
+                self.product_id,
+                self.location_id
             );
             return Ok(());
         }

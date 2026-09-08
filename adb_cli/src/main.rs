@@ -4,6 +4,7 @@
 mod adb_termios;
 mod compat;
 mod direct_daemon;
+mod wireless_forward_daemon;
 
 mod handlers;
 mod models;
@@ -126,6 +127,15 @@ fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> AD
 }
 
 fn main() -> ExitCode {
+    if std::env::var_os("ADB_CLI_WIRELESS_FORWARD_DAEMON").is_some() {
+        return match wireless_forward_daemon::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("adb_cli wireless forward daemon: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if std::env::var_os("ADB_CLI_DIRECT_DAEMON").is_some() {
         return match direct_daemon::run() {
             Ok(()) => ExitCode::SUCCESS,

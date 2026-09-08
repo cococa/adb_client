@@ -45,6 +45,19 @@ impl ADBUSBDevice {
         Self::new_from_transport_inner(USBTransport::new(vendor_id, product_id)?, private_key_path)
     }
 
+    /// Instantiate a device pinned to one physical macOS USB location.
+    pub fn new_with_custom_private_key_at_location<P: AsRef<Path>>(
+        vendor_id: u16,
+        product_id: u16,
+        location_id: u64,
+        private_key_path: P,
+    ) -> Result<Self> {
+        Self::new_from_transport_inner(
+            USBTransport::new_at_location(vendor_id, product_id, location_id)?,
+            private_key_path,
+        )
+    }
+
     /// Instantiate a new [`ADBUSBDevice`] from a [`USBTransport`] and an optional private key path.
     pub fn new_from_transport(
         transport: USBTransport,
@@ -100,9 +113,10 @@ impl ADBUSBDevice {
     /// Returns an error if multiple devices are connected or if none can be detected.
     pub fn autodetect_with_custom_private_key(private_key_path: PathBuf) -> Result<Self> {
         match utils::get_single_connected_adb_device()? {
-            Some(device_info) => Self::new_with_custom_private_key(
+            Some(device_info) => Self::new_with_custom_private_key_at_location(
                 device_info.vendor_id,
                 device_info.product_id,
+                device_info.location_id.unwrap_or(0),
                 private_key_path,
             ),
             _ => Err(RustADBError::DeviceNotFound(
@@ -143,7 +157,21 @@ impl ADBUSBDevice {
 impl ADBDispatchedUSBDevice {
     /// Serves local TCP forwarding through the authenticated USB transport.
     pub fn serve_forward(self: std::sync::Arc<Self>, local: String, remote: String) -> Result<()> {
-        self.inner.serve_forward(local, remote)
+        self.inner.serve_forward(local, remote, None)
+    }
+
+    /// Signals successful listener binding before serving connections.
+    pub fn serve_forward_ready(
+        self: std::sync::Arc<Self>,
+        local: String,
+        remote: String,
+        ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        let result = self.inner.serve_forward(local, remote, Some(&ready));
+        if let Err(error) = &result {
+            let _ = ready.send(Err(error.to_string()));
+        }
+        result
     }
     /// Lists local-to-remote TCP forwarding rules owned by this connection.
     pub fn forward_routes(&self) -> Vec<(String, String)> {
@@ -152,6 +180,10 @@ impl ADBDispatchedUSBDevice {
     /// Stops a local TCP forwarding rule and returns whether it existed.
     pub fn remove_forward(&self, local: &str) -> bool {
         self.inner.remove_forward(local)
+    }
+    /// Stops every local TCP forwarding rule owned by this connection.
+    pub fn remove_all_forwards(&self) -> usize {
+        self.inner.remove_all_forwards()
     }
     /// Returns reverse routes registered on this device.
     pub fn reverse_routes(&self) -> Result<Vec<(String, String)>> {

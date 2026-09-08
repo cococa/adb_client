@@ -26,7 +26,10 @@ use crate::{
     },
 };
 
-const READ_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// A USB read has no readiness primitive in this transport. 8 ms keeps input
+// latency below one display frame while avoiding 1,000 idle IOKit reads per
+// second for every connected device.
+const READ_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Debug)]
 enum DispatcherCommand {
@@ -35,9 +38,8 @@ enum DispatcherCommand {
         completion: Sender<Result<()>>,
     },
     Register {
-        local_id: u32,
         receiver: Sender<ADBTransportMessage>,
-        completion: Sender<()>,
+        completion: Sender<Result<u32>>,
     },
     Unregister {
         local_id: u32,
@@ -134,21 +136,20 @@ impl TransportDispatcher {
         }
     }
 
-    pub(crate) fn register(&self, local_id: u32) -> Result<DispatchedSession> {
+    pub(crate) fn register(&self) -> Result<DispatchedSession> {
         let (packet_tx, packet_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         self.command_tx
             .send(DispatcherCommand::Register {
-                local_id,
                 receiver: packet_tx,
                 completion: completion_tx,
             })
             .map_err(|_| {
                 RustADBError::ADBRequestFailed("ADB packet dispatcher stopped".to_owned())
             })?;
-        completion_rx.recv().map_err(|_| {
+        let local_id = completion_rx.recv().map_err(|_| {
             RustADBError::ADBRequestFailed("ADB packet dispatcher stopped".to_owned())
-        })?;
+        })??;
         Ok(DispatchedSession {
             local_id,
             command_tx: self.command_tx.clone(),
@@ -201,6 +202,22 @@ impl Drop for TransportDispatcher {
     }
 }
 
+fn allocate_local_id(
+    sessions: &HashMap<u32, Sender<ADBTransportMessage>>,
+    next_local_id: &mut u32,
+) -> Option<u32> {
+    // Zero is reserved by ADB OPEN packets. Allocation happens on the
+    // dispatcher thread, so a live ID can never be handed to two services.
+    for _ in 1..u32::MAX {
+        let candidate = *next_local_id;
+        *next_local_id = next_local_id.wrapping_add(1).max(1);
+        if candidate != 0 && !sessions.contains_key(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn run_loop<T: ADBMessageTransport>(
     transport: &mut T,
     command_rx: Receiver<DispatcherCommand>,
@@ -209,6 +226,7 @@ fn run_loop<T: ADBMessageTransport>(
 ) {
     let mut routes: HashMap<String, String> = HashMap::new();
     let mut sessions: HashMap<u32, Sender<ADBTransportMessage>> = HashMap::new();
+    let mut next_local_id = 1u32;
     loop {
         while let Ok(command) = command_rx.try_recv() {
             match command {
@@ -219,12 +237,20 @@ fn run_loop<T: ADBMessageTransport>(
                     let _ = completion.send(transport.write_message(message));
                 }
                 DispatcherCommand::Register {
-                    local_id,
                     receiver,
                     completion,
                 } => {
+                    let local_id = match allocate_local_id(&sessions, &mut next_local_id) {
+                        Some(id) => id,
+                        None => {
+                            let _ = completion.send(Err(RustADBError::ADBRequestFailed(
+                                "no ADB session IDs are available".to_owned(),
+                            )));
+                            continue;
+                        }
+                    };
                     sessions.insert(local_id, receiver);
-                    let _ = completion.send(());
+                    let _ = completion.send(Ok(local_id));
                 }
                 DispatcherCommand::Unregister { local_id } => {
                     sessions.remove(&local_id);
@@ -277,8 +303,13 @@ fn run_loop<T: ADBMessageTransport>(
                             .strip_prefix("tcp:")
                             .and_then(|s| s.parse::<u16>().ok())
                         {
-                            let local_id =
-                                (1..u32::MAX).find(|id| !sessions.contains_key(id)).unwrap();
+                            let Some(local_id) = allocate_local_id(&sessions, &mut next_local_id)
+                            else {
+                                eprintln!(
+                                    "[adb_client] no ADB session IDs are available for reverse relay"
+                                );
+                                continue;
+                            };
                             let (tx, rx) = mpsc::channel();
                             sessions.insert(local_id, tx);
                             let session = DispatchedSession {
@@ -396,13 +427,19 @@ mod tests {
             incoming: Arc::new(Mutex::new(input_rx)),
             written,
         });
-        let first = dispatcher.register(41).unwrap();
-        let second = dispatcher.register(42).unwrap();
+        let first = dispatcher.register().unwrap();
+        let second = dispatcher.register().unwrap();
         input_tx
-            .send(ADBTransportMessage::try_new(MessageCommand::Write, 700, 41, b"one").unwrap())
+            .send(
+                ADBTransportMessage::try_new(MessageCommand::Write, 700, first.local_id(), b"one")
+                    .unwrap(),
+            )
             .unwrap();
         input_tx
-            .send(ADBTransportMessage::try_new(MessageCommand::Write, 701, 42, b"two").unwrap())
+            .send(
+                ADBTransportMessage::try_new(MessageCommand::Write, 701, second.local_id(), b"two")
+                    .unwrap(),
+            )
             .unwrap();
         input_tx
             .send(
@@ -479,9 +516,12 @@ mod tests {
             b"swipe"
         );
         // Another shell session can progress while relay control waits for ACK.
-        let shell = dispatcher.register(123).unwrap();
+        let shell = dispatcher.register().unwrap();
         input
-            .send(ADBTransportMessage::try_new(MessageCommand::Write, 88, 123, b"model").unwrap())
+            .send(
+                ADBTransportMessage::try_new(MessageCommand::Write, 88, shell.local_id(), b"model")
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(shell.receive().unwrap().payload(), b"model");
         input
