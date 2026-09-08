@@ -1091,28 +1091,15 @@ fn run_server_device_command(
         Some("sync") => sync_compatible(&mut ServerTransferDevice(device), args)?,
         Some("install") => {
             let request = parse_install_request(args)?;
-            let suffix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
-            let remote = format!("/data/local/tmp/mab-server-install-{suffix}.apk");
-            let mut input = fs::File::open(&request.source)?;
-            device.push(&mut input, &remote)?;
-            let user = request
-                .user
-                .map(|user| format!(" --user {}", shell_quote(&user)))
-                .unwrap_or_default();
-            let command = format!(
-                "pm install {}{user} {}",
-                request.flags.join(" "),
-                shell_quote(&remote)
-            );
-            let result = server_shell_to(&mut device, &command, &mut std::io::stdout());
-            let _ = server_shell_to(
-                &mut device,
-                &format!("rm -f -- {}", shell_quote(&remote)),
-                &mut std::io::sink(),
-            );
-            result?;
+            // Match `adb install`: stream the APK through the selected ADB
+            // transport into a Package Manager install session. Do not push
+            // a temporary file and invoke `pm install` through a shell.
+            device.install_with_options(
+                &request.source,
+                request.user.as_deref(),
+                &request.flags,
+            )?;
+            println!("Success");
         }
         Some("uninstall") => {
             let request = parse_uninstall_request(args)?;

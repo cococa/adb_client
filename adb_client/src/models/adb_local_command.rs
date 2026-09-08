@@ -37,7 +37,10 @@ pub enum ADBLocalCommand {
     /// Uninstall a package, optionally for a specific user
     Uninstall(String, Option<String>),
     /// Install a package with the given size, optionally for a specific user
-    Install(u64, Option<String>),
+    /// and the supported package-manager flags requested by the client.
+    Install(u64, Option<String>, Vec<String>),
+    /// Execute Android Binder Bridge arguments without shell parsing.
+    AbbExec(Vec<String>),
     /// Switch the device to TCP/IP mode on the given port
     TcpIp(u16),
     /// Switch the device back to USB mode
@@ -78,13 +81,17 @@ impl Display for ADBLocalCommand {
                 }
                 write!(f, " {package}")
             }
-            Self::Install(size, user) => {
+            Self::Install(size, user, flags) => {
                 write!(f, "exec:cmd package 'install'")?;
                 if let Some(user) = user {
                     write!(f, " --user {user}")?;
                 }
+                for flag in flags {
+                    write!(f, " {flag}")?;
+                }
                 write!(f, " -S {size}")
             }
+            Self::AbbExec(arguments) => write!(f, "abb_exec:{}", arguments.join("\0")),
             Self::Forward(remote, local) => {
                 write!(f, "host:forward:{local};{remote}")
             }

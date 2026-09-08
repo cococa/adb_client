@@ -21,6 +21,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let mut session = self.open_session(&ADBLocalCommand::Install(
             file_size,
             user.map(ToString::to_string),
+            vec![],
         ))?;
 
         {
