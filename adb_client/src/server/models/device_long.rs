@@ -7,7 +7,7 @@ use crate::server::DeviceState;
 use regex::bytes::Regex;
 
 static DEVICES_LONG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<identifier>\S+)\s+(?P<state>\w+)\s+(usb:(?P<usb1>\S+)|(?P<usb2>\S+))?\s*(product:(?P<product>.*)\s+model:(?P<model>.*)\s+device:(?P<device>\S+)\s+)?transport_id:(?P<transport_id>\d+)$").expect("cannot build devices long regex")
+    Regex::new(r"^(?P<identifier>\S+)\s+(?P<state>\w+)\s+(usb:(?P<usb1>\S+)|(?P<usb2>\S+))?\s*(product:(?P<product>.*)\s+model:(?P<model>.*)\s+device:(?P<device>\S+))?\s*(transport_id:(?P<transport_id>\d+))?$").expect("cannot build devices long regex")
 });
 
 /// Represents a new device with more informations.
@@ -87,13 +87,10 @@ impl TryFrom<&[u8]> for DeviceLong {
                 None => "Unk".to_string(),
                 Some(device) => String::from_utf8(device.as_bytes().to_vec())?,
             },
-            transport_id: (str::from_utf8(
-                groups
-                    .name("transport_id")
-                    .ok_or(RustADBError::RegexParsingError)?
-                    .as_bytes(),
-            )?)
-            .parse::<u32>()?,
+            transport_id: match groups.name("transport_id") {
+                Some(value) => str::from_utf8(value.as_bytes())?.parse::<u32>()?,
+                None => 0,
+            },
         })
     }
 }
@@ -198,5 +195,15 @@ mod tests {
                 "parsed device does not match expected"
             );
         }
+    }
+
+    #[test]
+    fn test_devices_long_from_legacy_server_without_transport_id() {
+        let input =
+            b"6DRG49AI8DRC55FU device usb:17825792X product:pond model:2409BRN2CC device:pond";
+        let device = DeviceLong::try_from(input.as_slice()).unwrap();
+        assert_eq!(device.identifier, "6DRG49AI8DRC55FU");
+        assert_eq!(device.model, "2409BRN2CC");
+        assert_eq!(device.transport_id, 0);
     }
 }

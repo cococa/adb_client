@@ -7,7 +7,7 @@ use std::net::SocketAddrV4;
 use std::process::Command;
 
 /// Represents an ADB Server
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ADBServer {
     /// Internal [`TcpStream`], lazily initialized
     pub(crate) transport: Option<TCPServerTransport>,
@@ -18,6 +18,20 @@ pub struct ADBServer {
     /// Path to adb binary
     /// If not set, will use adb from PATH
     pub(crate) adb_path: Option<String>,
+    /// Whether a missing local server may be started through an adb executable.
+    pub(crate) auto_start: bool,
+}
+
+impl Default for ADBServer {
+    fn default() -> Self {
+        Self {
+            transport: None,
+            socket_addr: None,
+            envs: HashMap::new(),
+            adb_path: None,
+            auto_start: true,
+        }
+    }
 }
 
 impl ADBServer {
@@ -29,6 +43,22 @@ impl ADBServer {
             socket_addr: Some(address),
             envs: HashMap::new(),
             adb_path: None,
+            auto_start: true,
+        }
+    }
+
+    /// Connect only to an already-running ADB server.
+    ///
+    /// This never launches an `adb` executable and is suitable for sandboxed
+    /// applications that optionally reuse a developer-owned server.
+    #[must_use]
+    pub fn new_existing(address: SocketAddrV4) -> Self {
+        Self {
+            transport: None,
+            socket_addr: Some(address),
+            envs: HashMap::new(),
+            adb_path: None,
+            auto_start: false,
         }
     }
 
@@ -40,6 +70,7 @@ impl ADBServer {
             socket_addr: Some(address),
             envs: HashMap::new(),
             adb_path,
+            auto_start: true,
         }
     }
 
@@ -100,7 +131,7 @@ impl ADBServer {
             TCPServerTransport::default()
         };
 
-        if is_local_ip {
+        if is_local_ip && self.auto_start {
             Self::start(&self.envs, &self.adb_path);
         }
 

@@ -4,8 +4,10 @@ use crate::{
     wireless_forward_daemon,
 };
 use adb_client::{
-    ADBDeviceExt,
+    ADBDeviceExt, RebootType,
     mdns::MDNSDiscoveryService,
+    server::{ADBServer, DeviceLong},
+    server_device::ADBServerDevice,
     tcp::ADBTcpDevice,
     usb::{ADBDeviceInfo, find_all_connected_adb_devices},
     wireless,
@@ -13,7 +15,7 @@ use adb_client::{
 use std::{
     collections::BTreeSet,
     fs,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
@@ -329,7 +331,7 @@ impl CompatTransferDevice for WirelessTransferDevice {
         remote: &str,
         destination: &mut fs::File,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.0.pull(remote, destination)?;
+        self.0.pull(&remote, destination)?;
         Ok(())
     }
 }
@@ -359,6 +361,93 @@ impl CompatTransferDevice for USBTransferDevice<'_> {
         direct_daemon::stream_request_to(self.0, &format!("PULL\t{remote}"), destination)?;
         Ok(())
     }
+}
+
+struct ServerTransferDevice(ADBServerDevice);
+
+impl CompatTransferDevice for ServerTransferDevice {
+    fn shell(&mut self, command: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        let status =
+            self.0
+                .shell_command(&command, Some(&mut output), Some(&mut std::io::stderr()))?;
+        if status.is_some_and(|status| status != 0) {
+            return Err(format!("remote shell exited with status {}", status.unwrap()).into());
+        }
+        Ok(output)
+    }
+
+    fn push_file(&mut self, source: &Path, remote: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut input = fs::File::open(source)?;
+        self.0.push(&mut input, &remote)?;
+        Ok(())
+    }
+
+    fn pull_file(
+        &mut self,
+        remote: &str,
+        destination: &mut fs::File,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.0.pull(&remote, destination)?;
+        Ok(())
+    }
+}
+
+const DEFAULT_ADB_SERVER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5037);
+
+fn configured_server_address() -> Result<SocketAddrV4, Box<dyn std::error::Error>> {
+    std::env::var("MACANDROIDBRIDGE_ADB_SERVER")
+        .unwrap_or_else(|_| DEFAULT_ADB_SERVER.to_string())
+        .parse()
+        .map_err(Into::into)
+}
+
+fn existing_server_devices()
+-> Result<Option<(SocketAddrV4, Vec<DeviceLong>)>, Box<dyn std::error::Error>> {
+    let mode = std::env::var("MACANDROIDBRIDGE_ADB_MODE").unwrap_or_else(|_| "auto".to_owned());
+    if mode == "direct" {
+        return Ok(None);
+    }
+    if !matches!(mode.as_str(), "auto" | "server") {
+        return Err(format!("invalid MACANDROIDBRIDGE_ADB_MODE: {mode}").into());
+    }
+    let address = configured_server_address()?;
+    let mut server = ADBServer::new_existing(address);
+    match server.devices_long() {
+        Ok(devices) => Ok(Some((address, devices))),
+        Err(error) if mode == "auto" => {
+            if TcpStream::connect_timeout(&SocketAddr::V4(address), Duration::from_millis(250))
+                .is_ok()
+            {
+                Err(format!(
+                    "existing ADB server at {address} rejected the compatibility request: {error}"
+                )
+                .into())
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => {
+            Err(format!("existing ADB server at {address} is unavailable: {error}").into())
+        }
+    }
+}
+
+fn server_device(
+    address: SocketAddrV4,
+    serial: Option<&str>,
+    transport_id: Option<u64>,
+) -> Result<ADBServerDevice, Box<dyn std::error::Error>> {
+    if let Some(id) = transport_id {
+        return Ok(ADBServerDevice::new_with_transport_id(
+            u32::try_from(id).map_err(|_| "ADB server transport id exceeds u32")?,
+            Some(address),
+        ));
+    }
+    Ok(serial.map_or_else(
+        || ADBServerDevice::autodetect(Some(address)),
+        |serial| ADBServerDevice::new(serial.to_owned(), Some(address)),
+    ))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -516,7 +605,7 @@ fn remote_manifest(
     validate_transfer_path(source)?;
     let quoted = shell_quote(source);
     let script = format!(
-        "find {quoted} -print | while IFS= read -r p; do if [ -L \"$p\" ]; then k=l; elif [ -d \"$p\" ]; then k=d; elif [ -f \"$p\" ]; then k=f; else k=o; fi; printf '%s\\t' \"$k\"; stat -c '%a\\t%Y\\t%n' -- \"$p\"; done"
+        "find {quoted} -print | while IFS= read -r p; do if [ -L \"$p\" ]; then k=l; elif [ -d \"$p\" ]; then k=d; elif [ -f \"$p\" ]; then k=f; else k=o; fi; mode=$(stat -c '%a' -- \"$p\") || exit; mtime=$(stat -c '%Y' -- \"$p\") || exit; printf '%s\\t%s\\t%s\\t%s\\n' \"$k\" \"$mode\" \"$mtime\" \"$p\"; done"
     );
     let output = device.shell(&script)?;
     let mut entries = Vec::new();
@@ -919,6 +1008,168 @@ fn run_wireless_device_command(
     Ok(())
 }
 
+fn server_shell_to(
+    device: &mut ADBServerDevice,
+    command: &str,
+    output: &mut dyn std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = device.shell_command(&command, Some(output), Some(&mut std::io::stderr()))?;
+    if let Some(status) = status
+        && status != 0
+    {
+        return Err(format!("remote shell exited with status {status}").into());
+    }
+    Ok(())
+}
+
+fn run_server_device_command(
+    address: SocketAddrV4,
+    serial: Option<&str>,
+    transport_id: Option<u64>,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut device = server_device(address, serial, transport_id)?;
+    if let Some(forward) = parse_forward_request(args)? {
+        match forward {
+            ForwardRequest::Add(local, remote) => {
+                // adb_client's server API accepts (remote, local), while the
+                // adb CLI syntax is `forward LOCAL REMOTE`.
+                device.forward(remote.to_owned(), local.to_owned())?;
+            }
+            ForwardRequest::Remove(local) => device.forward_remove(local.to_owned())?,
+            ForwardRequest::RemoveAll => device.forward_remove_all()?,
+            ForwardRequest::List => {
+                return Err("forward --list is not yet available through ADB server mode".into());
+            }
+        }
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("get-state") if args.len() == 1 => println!("device"),
+        Some("get-serialno") if args.len() == 1 => {
+            if let Some(serial) = serial {
+                println!("{serial}");
+            } else {
+                let mut output = Vec::new();
+                server_shell_to(&mut device, "getprop ro.serialno", &mut output)?;
+                print!("{}", String::from_utf8(output)?);
+            }
+        }
+        Some("features") if args.len() == 1 => {
+            println!(
+                "{}",
+                device
+                    .host_features()?
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        Some("shell") | Some("exec-out") => {
+            let mut command_args = args[1..].to_vec();
+            while let Some(option) = command_args.first().map(String::as_str) {
+                if matches!(option, "-T" | "-t" | "-tt" | "-x" | "--" | "-n") {
+                    command_args.remove(0);
+                } else {
+                    break;
+                }
+            }
+            server_shell_to(&mut device, &command_args.join(" "), &mut std::io::stdout())?;
+        }
+        Some("pull-stream") if args.len() == 2 => {
+            device.pull(&args[1], &mut std::io::stdout())?;
+        }
+        Some("pull") => {
+            let request = transfer_paths(args, "pull")?;
+            pull_compatible(&mut ServerTransferDevice(device), request)?;
+        }
+        Some("push") => {
+            let request = transfer_paths(args, "push")?;
+            push_compatible(&mut ServerTransferDevice(device), request)?;
+        }
+        Some("sync") => sync_compatible(&mut ServerTransferDevice(device), args)?,
+        Some("install") => {
+            let request = parse_install_request(args)?;
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let remote = format!("/data/local/tmp/mab-server-install-{suffix}.apk");
+            let mut input = fs::File::open(&request.source)?;
+            device.push(&mut input, &remote)?;
+            let user = request
+                .user
+                .map(|user| format!(" --user {}", shell_quote(&user)))
+                .unwrap_or_default();
+            let command = format!(
+                "pm install {}{user} {}",
+                request.flags.join(" "),
+                shell_quote(&remote)
+            );
+            let result = server_shell_to(&mut device, &command, &mut std::io::stdout());
+            let _ = server_shell_to(
+                &mut device,
+                &format!("rm -f -- {}", shell_quote(&remote)),
+                &mut std::io::sink(),
+            );
+            result?;
+        }
+        Some("uninstall") => {
+            let request = parse_uninstall_request(args)?;
+            let keep = if request.keep_data { " -k" } else { "" };
+            let user = request
+                .user
+                .map(|user| format!(" --user {}", shell_quote(&user)))
+                .unwrap_or_default();
+            server_shell_to(
+                &mut device,
+                &format!("pm uninstall{keep}{user} {}", shell_quote(&request.package)),
+                &mut std::io::stdout(),
+            )?;
+        }
+        Some("root") if args.len() == 1 => device.root()?,
+        Some("remount") if args.len() == 1 => {
+            let _ = device.remount()?;
+        }
+        Some("reboot") if args.len() <= 2 => {
+            let reboot_type = match args.get(1).map(String::as_str) {
+                None => RebootType::System,
+                Some("bootloader") => RebootType::Bootloader,
+                Some("recovery") => RebootType::Recovery,
+                Some("sideload") => RebootType::Sideload,
+                Some(mode) => return Err(format!("unsupported reboot mode: {mode}").into()),
+            };
+            device.reboot(reboot_type)?;
+        }
+        Some("reverse")
+            if args.get(1).map(String::as_str) == Some("--remove") && args.len() == 3 =>
+        {
+            device.reverse_remove(args[2].clone())?;
+        }
+        Some("reverse")
+            if args.get(1).map(String::as_str) == Some("--remove-all") && args.len() == 2 =>
+        {
+            device.reverse_remove_all()?;
+        }
+        Some("reverse") if args.len() == 3 => {
+            device.reverse(args[1].clone(), args[2].clone())?;
+        }
+        Some("reverse") if args.get(1).map(String::as_str) == Some("--list") => {
+            return Err("reverse --list is not yet available through ADB server mode".into());
+        }
+        Some("logcat") => {
+            let command = if args.len() == 1 {
+                "logcat".to_owned()
+            } else {
+                format!("logcat {}", args[1..].join(" "))
+            };
+            server_shell_to(&mut device, &command, &mut std::io::stdout())?;
+        }
+        _ => return Err(format!("unsupported ADB server command: {}", args.join(" ")).into()),
+    }
+    Ok(())
+}
+
 pub fn run() -> ExitCode {
     match run_inner() {
         Ok(()) => ExitCode::SUCCESS,
@@ -1062,6 +1313,100 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         Some("disconnect") => return Err("usage: adb disconnect [HOST:PORT|-a]".into()),
         Some("mdns") => return Err("usage: adb mdns check|services".into()),
         _ => {}
+    }
+    let server = if endpoint.is_none() {
+        existing_server_devices()?
+    } else {
+        None
+    };
+    if args.first().map(String::as_str) == Some("server-status") {
+        if args.len() != 1 {
+            return Err("server-status does not accept arguments".into());
+        }
+        let (address, _) = server.ok_or("no compatible ADB server is running")?;
+        println!("ADB server available at {address}");
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("devices")
+        && let Some((_, server_devices)) = &server
+    {
+        if args.len() > 2 || args.get(1).is_some_and(|option| option != "-l") {
+            return Err("usage: adb devices [-l]".into());
+        }
+        println!("List of devices attached");
+        let mut identifiers = BTreeSet::new();
+        for device in server_devices {
+            identifiers.insert(device.identifier.clone());
+            if args.get(1).map(String::as_str) == Some("-l") {
+                println!("{device} mab_transport:server");
+            } else {
+                println!("{}\t{}", device.identifier, device.state);
+            }
+        }
+        // Preserve adb_client-managed wireless endpoints that are not also
+        // registered in the developer-owned ADB server.
+        for address in wireless_endpoints(&key)? {
+            if identifiers.contains(&address.to_string()) {
+                continue;
+            }
+            match connect_wireless(address, &key) {
+                Ok(serial) => println!(
+                    "{address}\tdevice product:wireless model:{serial} transport_id:{}",
+                    stable_transport_id("tcp", &address.to_string())
+                ),
+                Err(_) => println!(
+                    "{address}\toffline transport_id:{}",
+                    stable_transport_id("tcp", &address.to_string())
+                ),
+            }
+        }
+        return Ok(());
+    }
+    if args.as_slice() == ["start-server"] && server.is_some() {
+        return Ok(());
+    }
+    if args.as_slice() == ["wait-for-device"]
+        && server
+            .as_ref()
+            .is_some_and(|(_, devices)| !devices.is_empty())
+    {
+        return Ok(());
+    }
+    if let Some((address, server_devices)) = &server {
+        let matching_server_devices: Vec<_> = server_devices
+            .iter()
+            .filter(|device| {
+                serial
+                    .as_ref()
+                    .is_none_or(|serial| &device.identifier == serial)
+                    && selected_transport_id.is_none_or(|id| u64::from(device.transport_id) == id)
+            })
+            .collect();
+        let server_selected = if serial.is_some() || selected_transport_id.is_some() {
+            matching_server_devices.len() == 1
+        } else {
+            server_devices.len() == 1
+        };
+        if server_selected {
+            return run_server_device_command(
+                *address,
+                serial.as_deref(),
+                selected_transport_id,
+                &args,
+            );
+        }
+        if !server_devices.is_empty()
+            && serial.is_none()
+            && selected_transport_id.is_none()
+            && !matches!(
+                args.first().map(String::as_str),
+                Some("start-server" | "wait-for-device")
+            )
+        {
+            return Err(
+                "multiple devices connected through ADB server; select one with -s or -t".into(),
+            );
+        }
     }
     if endpoint.is_none()
         && let Some(address) = serial
