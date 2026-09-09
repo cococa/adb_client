@@ -227,6 +227,7 @@ fn run_loop<T: ADBMessageTransport>(
     let mut routes: HashMap<String, String> = HashMap::new();
     let mut sessions: HashMap<u32, Sender<ADBTransportMessage>> = HashMap::new();
     let mut next_local_id = 1u32;
+    let mut reverse_connectors = HashMap::new();
     loop {
         while let Ok(command) = command_rx.try_recv() {
             match command {
@@ -318,14 +319,11 @@ fn run_loop<T: ADBMessageTransport>(
                                 packet_rx: rx,
                             };
                             let remote_id = packet.header().arg0();
-                            thread::spawn(move || {
-                                if let Err(error) = relay(session, remote_id, port) {
-                                    eprintln!(
-                                        "[adb_client] reverse relay failed for tcp:{port}: {error}"
-                                    );
-                                    log::debug!("reverse relay closed: {error}");
-                                }
-                            });
+                            let connector = reverse_connectors
+                                .entry(port)
+                                .or_insert_with(|| ordered_reverse_connector(port));
+                            eprintln!("[MirrorDebug][relay] queued local={local_id} remote={remote_id} port={port}");
+                            let _ = connector.send((session, remote_id));
                         }
                     } else {
                         let _ = transport.write_message(
@@ -417,6 +415,47 @@ mod tests {
             self.written.send(message).unwrap();
             Ok(())
         }
+    }
+
+    #[test]
+    fn reverse_connections_preserve_enqueue_order() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let connector = ordered_reverse_connector(listener.local_addr().unwrap().port());
+        let (input_tx, input_rx) = mpsc::channel();
+        let (written, _output) = mpsc::channel();
+        let dispatcher = TransportDispatcher::start(TestTransport {
+            incoming: Arc::new(Mutex::new(input_rx)),
+            written,
+        });
+        for index in 0..24u8 {
+            let session = dispatcher.register().unwrap();
+            let local_id = session.local_id();
+            connector.send((session, 100 + u32::from(index))).unwrap();
+            input_tx.send(ADBTransportMessage::try_new(
+                MessageCommand::Write, 100 + u32::from(index), local_id, &[index],
+            ).unwrap()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        for expected in 0..24u8 {
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "reverse connect timed out");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], expected, "reverse sockets arrived out of order");
+        }
+        dispatcher.shutdown();
     }
 
     #[test]
@@ -540,25 +579,41 @@ mod tests {
 
 // One outstanding host WRTE per stream. Device video/audio writes continue
 // to be acknowledged while waiting for control-input acknowledgements.
-fn relay(session: DispatchedSession, remote_id: u32, port: u16) -> Result<()> {
+fn ordered_reverse_connector(port: u16) -> Sender<(DispatchedSession, u32)> {
+    let (tx, rx) = mpsc::channel::<(DispatchedSession, u32)>();
+    // Preserve OPEN order for each destination. Connecting inside independent
+    // relay threads can swap scrcpy's video/audio/control sockets. Keep the
+    // blocking connect off the transport dispatcher and other destinations.
+    thread::spawn(move || {
+        for (sequence, (session, remote_id)) in rx.into_iter().enumerate() {
+            let local_id = session.local_id;
+            match std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_secs(2),
+            ) {
+                Ok(socket) => {
+                    eprintln!("[MirrorDebug][relay] connected sequence={sequence} local={local_id} remote={remote_id} port={port}");
+                    thread::spawn(move || {
+                        let result = relay(session, remote_id, socket);
+                        eprintln!("[MirrorDebug][relay] closed local={local_id} remote={remote_id} port={port} result={result:?}");
+                    });
+                }
+                Err(error) => {
+                    eprintln!("[MirrorDebug][relay] connect failed sequence={sequence} local={local_id} remote={remote_id} port={port}: {error}");
+                    if let Ok(packet) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, remote_id, &[]) {
+                        let _ = session.send(packet);
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
+
+fn relay(session: DispatchedSession, remote_id: u32, mut socket: std::net::TcpStream) -> Result<()> {
     use std::{
         io::{Read, Write},
-        net::{Shutdown, TcpStream},
-    };
-    let mut socket = match TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_secs(2),
-    ) {
-        Ok(socket) => socket,
-        Err(error) => {
-            session.send(ADBTransportMessage::try_new(
-                MessageCommand::Clse,
-                0,
-                remote_id,
-                &[],
-            )?)?;
-            return Err(error.into());
-        }
+        net::Shutdown,
     };
     socket.set_nodelay(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(1)))?;

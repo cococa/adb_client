@@ -381,17 +381,26 @@ impl DispatchedADBMessageDevice {
                 2 => {
                     // Bound diagnostics without blocking or mixing stderr into binary data.
                     if errors.len() < 64 * 1024 {
-                        errors.extend_from_slice(&data);
+                        let remaining = 64 * 1024 - errors.len();
+                        errors.extend_from_slice(&data[..data.len().min(remaining)]);
                     }
                 }
                 3 => {
+                    if data.len() != 1 {
+                        return Err(RustADBError::ADBShellV2ParseError(format!(
+                            "exit packet has {} bytes instead of 1",
+                            data.len()
+                        )));
+                    }
                     service.close_ack()?;
-                    return match data.first() {
-                        Some(0) => Ok(()),
-                        code => Err(RustADBError::ADBRequestFailed(format!(
-                            "remote command exited {code:?}: {}",
+                    let code = data[0];
+                    return if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(RustADBError::ADBRequestFailed(format!(
+                            "remote command exited {code}: {}",
                             String::from_utf8_lossy(&errors)
-                        ))),
+                        )))
                     };
                 }
                 _ => {
