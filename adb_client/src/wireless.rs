@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256, Sha512};
 use subtle::{Choice, ConditionallySelectable};
 use zeroize::Zeroizing;
 
-use crate::{ADBRsaKey, Result, RustADBError, read_adb_private_key};
+use crate::{ADBRsaKey, Result, RustADBError, load_or_create_adb_private_key};
 
 const CLIENT_NAME: &[u8] = b"adb pair client\0";
 const SERVER_NAME: &[u8] = b"adb pair server\0";
@@ -92,12 +92,7 @@ pub fn pair(address: SocketAddr, pairing_code: &str, key_path: &Path) -> Result<
 }
 
 fn load_or_create_key(path: &Path) -> Result<ADBRsaKey> {
-    if let Some(key) = read_adb_private_key(path)? {
-        return Ok(key);
-    }
-    let key = ADBRsaKey::new_random()?;
-    key.write_pkcs8(path)?;
-    Ok(key)
+    load_or_create_adb_private_key(path)
 }
 
 fn connect_tls(

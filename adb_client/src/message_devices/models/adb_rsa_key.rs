@@ -6,13 +6,16 @@ use num_traits::cast::ToPrimitive;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey};
-use std::fs::{OpenOptions, create_dir_all, read_to_string};
+use std::fs::{OpenOptions, create_dir_all, hard_link, read_to_string, remove_file};
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ADB_PRIVATE_KEY_SIZE: usize = 2048;
 const ANDROID_PUBKEY_MODULUS_SIZE_WORDS: u32 = 64;
+static KEY_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -80,7 +83,6 @@ impl ADBRsaKey {
         options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
-        use std::io::Write;
         let mut file = options.open(path)?;
         file.write_all(pem.as_bytes())?;
         Ok(())
@@ -139,6 +141,68 @@ impl ADBRsaKey {
     }
 }
 
+/// Loads a shared host key or atomically publishes one complete new key.
+/// Concurrent processes generate their own candidates, but only the first
+/// hard link wins; all others load that same fully written identity.
+pub fn load_or_create_adb_private_key<P: AsRef<Path>>(private_key_path: P) -> Result<ADBRsaKey> {
+    let path = private_key_path.as_ref();
+    if let Some(key) = read_adb_private_key(path)? {
+        return Ok(key);
+    }
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+
+    let candidate = ADBRsaKey::new_random()?;
+    let pem = candidate.to_pkcs8_pem()?;
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = loop {
+        let sequence = KEY_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_file_name(format!(
+            ".{filename}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(pem.as_bytes()).and_then(|_| file.sync_all()) {
+                    drop(file);
+                    let _ = remove_file(&temporary);
+                    return Err(error.into());
+                }
+                break temporary;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+
+    match hard_link(&temporary, path) {
+        Ok(()) => {
+            remove_file(&temporary)?;
+            Ok(candidate)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            remove_file(&temporary)?;
+            read_adb_private_key(path)?.ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::NotFound,
+                    "shared ADB key disappeared after publication",
+                )
+                .into()
+            })
+        }
+        Err(error) => {
+            let _ = remove_file(&temporary);
+            Err(error.into())
+        }
+    }
+}
+
 /// Reads a PKCS#8 host identity, returning `None` when the file does not exist.
 pub fn read_adb_private_key<P: AsRef<Path>>(private_key_path: P) -> Result<Option<ADBRsaKey>> {
     // Try to read the private key file from given path
@@ -166,9 +230,13 @@ fn set_bit(n: usize) -> Result<BigUint> {
 
 #[cfg(test)]
 mod tests {
-    use super::set_bit;
+    use super::{
+        KEY_TEMPORARY_SEQUENCE, load_or_create_adb_private_key, read_adb_private_key, set_bit,
+    };
     use crate::message_devices::models::ADBRsaKey;
     use rsa::BigUint;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn test_pubkey_gen() {
@@ -249,5 +317,51 @@ ile69MHFENUePSpuRSiF3Z02
         assert_eq!(r2048, expected_r2048);
         // Verify bit length: 2^2048 has exactly 2049 bits
         assert_eq!(r2048.bits(), 2049);
+    }
+
+    #[test]
+    fn concurrent_key_creation_publishes_one_complete_identity() {
+        let directory = std::env::temp_dir().join(format!(
+            "adb-key-race-{}-{}",
+            std::process::id(),
+            KEY_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("adbkey.pk8");
+        let barrier = Arc::new(Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_adb_private_key(path)
+                        .unwrap()
+                        .to_pkcs8_pem()
+                        .unwrap()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(
+            read_adb_private_key(&path)
+                .unwrap()
+                .unwrap()
+                .to_pkcs8_pem()
+                .unwrap(),
+            keys[0]
+        );
+        assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

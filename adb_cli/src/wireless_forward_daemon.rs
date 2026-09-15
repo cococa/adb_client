@@ -10,12 +10,29 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use adb_client::tcp::{ADBDispatchedTCPDevice, ADBTcpDevice};
+
+use crate::local_socket::DeadlineUnixStream;
+
+const MAX_CONCURRENT_REQUESTS: usize = 12;
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(100);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ActiveRequest(Arc<AtomicUsize>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 pub(crate) struct Context<'a> {
     pub address: SocketAddr,
@@ -43,7 +60,7 @@ fn ensure_running(context: &Context<'_>) -> Result<(), Box<dyn std::error::Error
         .mode(0o600)
         .open(socket.with_extension("lock"))?;
     lock.lock()?;
-    if request_once(&socket, "PING").is_ok() {
+    if request_once(&socket, "PING", HEALTH_CHECK_TIMEOUT).is_ok() {
         return Ok(());
     }
     if socket.exists() {
@@ -64,7 +81,7 @@ fn ensure_running(context: &Context<'_>) -> Result<(), Box<dyn std::error::Error
         )
         .spawn()?;
     for _ in 0..100 {
-        if request_once(&socket, "PING").is_ok() {
+        if request_once(&socket, "PING", HEALTH_CHECK_TIMEOUT).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
@@ -81,17 +98,16 @@ pub(crate) fn request(
     request: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     ensure_running(context)?;
-    request_once(&socket_path(context)?, request)
+    request_once(&socket_path(context)?, request, CONTROL_TIMEOUT)
 }
 
-fn request_once(socket: &Path, request: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(socket)?;
-    // macOS returns EINVAL for SO_RCVTIMEO/SO_SNDTIMEO on AF_UNIX.
-    #[cfg(not(target_os = "macos"))]
-    {
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    }
+fn request_once(
+    socket: &Path,
+    request: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket)?;
+    let mut stream = DeadlineUnixStream::new(stream, timeout)?;
     stream.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
     stream.write_all(request.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -119,18 +135,23 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let mut last_request = Instant::now();
+    let active_requests = Arc::new(AtomicUsize::new(0));
     while device.is_alive() {
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_nonblocking(false)?;
-                #[cfg(not(target_os = "macos"))]
-                {
-                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-                }
+            Ok((stream, _)) => {
+                let mut stream = DeadlineUnixStream::new(stream, CONTROL_TIMEOUT)?;
                 last_request = Instant::now();
+                let active = Arc::clone(&active_requests);
+                let reserved = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < MAX_CONCURRENT_REQUESTS).then_some(count + 1)
+                });
+                if reserved.is_err() {
+                    let _ = stream.write_all(b"ERR\ttoo many concurrent requests\n");
+                    continue;
+                }
                 let device = Arc::clone(&device);
                 thread::spawn(move || {
+                    let _active_request = ActiveRequest(active);
                     if let Err(error) = handle(device, &mut stream) {
                         let _ = writeln!(stream, "ERR\t{error}");
                     }
@@ -153,7 +174,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle(
     device: Arc<ADBDispatchedTCPDevice>,
-    stream: &mut UnixStream,
+    stream: &mut DeadlineUnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut length = [0; 4];
     stream.read_exact(&mut length)?;

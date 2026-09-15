@@ -318,6 +318,7 @@ impl ADBMessageTransport for USBTransport {
         let mut header_bytes = [0u8; 24];
         self.read_exact(&mut header_bytes, timeout)?;
         let header = ADBTransportMessageHeader::try_from(header_bytes)?;
+        header.validate_before_payload()?;
         log::trace!(
             "received ADB message {:?}, arg0={}, arg1={}, payload={} bytes",
             header.command(),

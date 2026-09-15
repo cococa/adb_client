@@ -322,7 +322,9 @@ fn run_loop<T: ADBMessageTransport>(
                             let connector = reverse_connectors
                                 .entry(port)
                                 .or_insert_with(|| ordered_reverse_connector(port));
-                            eprintln!("[MirrorDebug][relay] queued local={local_id} remote={remote_id} port={port}");
+                            eprintln!(
+                                "[MirrorDebug][relay] queued local={local_id} remote={remote_id} port={port}"
+                            );
                             let _ = connector.send((session, remote_id));
                         }
                     } else {
@@ -433,9 +435,17 @@ mod tests {
             let session = dispatcher.register().unwrap();
             let local_id = session.local_id();
             connector.send((session, 100 + u32::from(index))).unwrap();
-            input_tx.send(ADBTransportMessage::try_new(
-                MessageCommand::Write, 100 + u32::from(index), local_id, &[index],
-            ).unwrap()).unwrap();
+            input_tx
+                .send(
+                    ADBTransportMessage::try_new(
+                        MessageCommand::Write,
+                        100 + u32::from(index),
+                        local_id,
+                        &[index],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         for expected in 0..24u8 {
@@ -443,14 +453,19 @@ mod tests {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(std::time::Instant::now() < deadline, "reverse connect timed out");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "reverse connect timed out"
+                        );
                         thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
             socket.set_nonblocking(false).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut byte = [0];
             socket.read_exact(&mut byte).unwrap();
             assert_eq!(byte[0], expected, "reverse sockets arrived out of order");
@@ -592,15 +607,23 @@ fn ordered_reverse_connector(port: u16) -> Sender<(DispatchedSession, u32)> {
                 Duration::from_secs(2),
             ) {
                 Ok(socket) => {
-                    eprintln!("[MirrorDebug][relay] connected sequence={sequence} local={local_id} remote={remote_id} port={port}");
+                    eprintln!(
+                        "[MirrorDebug][relay] connected sequence={sequence} local={local_id} remote={remote_id} port={port}"
+                    );
                     thread::spawn(move || {
                         let result = relay(session, remote_id, socket);
-                        eprintln!("[MirrorDebug][relay] closed local={local_id} remote={remote_id} port={port} result={result:?}");
+                        eprintln!(
+                            "[MirrorDebug][relay] closed local={local_id} remote={remote_id} port={port} result={result:?}"
+                        );
                     });
                 }
                 Err(error) => {
-                    eprintln!("[MirrorDebug][relay] connect failed sequence={sequence} local={local_id} remote={remote_id} port={port}: {error}");
-                    if let Ok(packet) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, remote_id, &[]) {
+                    eprintln!(
+                        "[MirrorDebug][relay] connect failed sequence={sequence} local={local_id} remote={remote_id} port={port}: {error}"
+                    );
+                    if let Ok(packet) =
+                        ADBTransportMessage::try_new(MessageCommand::Clse, 0, remote_id, &[])
+                    {
                         let _ = session.send(packet);
                     }
                 }
@@ -610,7 +633,11 @@ fn ordered_reverse_connector(port: u16) -> Sender<(DispatchedSession, u32)> {
     tx
 }
 
-fn relay(session: DispatchedSession, remote_id: u32, mut socket: std::net::TcpStream) -> Result<()> {
+fn relay(
+    session: DispatchedSession,
+    remote_id: u32,
+    mut socket: std::net::TcpStream,
+) -> Result<()> {
     use std::{
         io::{Read, Write},
         net::Shutdown,

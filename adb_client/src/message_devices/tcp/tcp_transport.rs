@@ -111,7 +111,8 @@ impl TcpTransport {
 
 impl ADBTransport for TcpTransport {
     fn connect(&mut self) -> Result<()> {
-        let stream = TcpStream::connect(self.address)?;
+        let stream = TcpStream::connect_timeout(&self.address, Duration::from_secs(3))?;
+        stream.set_nodelay(true)?;
         self.current_connection = Some(Arc::new(Mutex::new(CurrentConnection::Tcp(stream))));
         Ok(())
     }
@@ -169,29 +170,25 @@ impl ADBMessageTransport for TcpTransport {
         }
 
         let header = ADBTransportMessageHeader::try_from(data)?;
+        header.validate_before_payload()?;
 
-        if header.data_length() != 0 {
-            let mut msg_data = vec![0_u8; header.data_length() as usize];
+        let mut msg_data = vec![0_u8; header.data_length() as usize];
+        if !msg_data.is_empty() {
             raw_connection.read_exact(&mut msg_data).map_err(|error| {
                 RustADBError::ADBRequestFailed(format!(
                     "incomplete wireless ADB packet payload: {error}"
                 ))
             })?;
-
-            let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
-
-            // Check message integrity
-            if !message.check_message_integrity() {
-                return Err(RustADBError::InvalidIntegrity(
-                    ADBTransportMessageHeader::compute_crc32(message.payload()),
-                    message.header().data_crc32(),
-                ));
-            }
-
-            return Ok(message);
         }
+        let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
 
-        Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
+        if !message.check_message_integrity() {
+            return Err(RustADBError::InvalidIntegrity(
+                ADBTransportMessageHeader::compute_crc32(message.payload()),
+                message.header().data_crc32(),
+            ));
+        }
+        Ok(message)
     }
 
     fn write_message_with_timeout(

@@ -4,6 +4,7 @@
 mod adb_termios;
 mod compat;
 mod direct_daemon;
+mod local_socket;
 mod wireless_forward_daemon;
 
 mod handlers;

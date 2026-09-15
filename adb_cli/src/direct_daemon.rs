@@ -23,6 +23,8 @@ use std::{
 
 use adb_client::usb::{ADBDispatchedUSBDevice, ADBUSBDevice};
 
+use crate::local_socket::DeadlineUnixStream;
+
 pub(crate) struct Context {
     pub key: PathBuf,
     pub vendor: u16,
@@ -31,6 +33,10 @@ pub(crate) struct Context {
 }
 
 const MAX_CONCURRENT_REQUESTS: usize = 12;
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(100);
+const CONTROL_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct ActiveRequest(Arc<AtomicUsize>);
 
@@ -61,6 +67,18 @@ pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::err
     Ok(std::env::temp_dir().join(format!("mab3-{hash:016x}.sock")))
 }
 
+fn daemon_is_healthy(socket: &std::path::Path) -> bool {
+    let Ok(probe) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let Ok(mut probe) = DeadlineUnixStream::new(probe, HEALTH_CHECK_TIMEOUT) else {
+        return false;
+    };
+    probe.write_all(&0u32.to_be_bytes()).is_ok()
+        && probe.shutdown(std::net::Shutdown::Write).is_ok()
+        && probe.read_exact(&mut [0; 4]).is_ok()
+}
+
 pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
     let socket = socket_path(context)?;
     let lock = fs::OpenOptions::new()
@@ -70,16 +88,10 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         .mode(0o600)
         .open(socket.with_extension("lock"))?;
     lock.lock()?;
-    if let Ok(mut probe) = UnixStream::connect(&socket) {
-        probe.write_all(&0u32.to_be_bytes())?;
-        probe.shutdown(std::net::Shutdown::Write)?;
-        let mut response = [0u8; 4];
-        // A healthy daemon responds with an error for an empty request; the
-        // important signal is that the control socket is serviced.
-        if probe.read_exact(&mut response).is_ok() {
-            return Ok(());
-        }
-        let _ = fs::remove_file(&socket);
+    // A healthy daemon responds with an error for an empty request; the
+    // important signal is that the control socket is serviced before deadline.
+    if daemon_is_healthy(&socket) {
+        return Ok(());
     }
     if socket.exists() {
         fs::remove_file(&socket)?;
@@ -101,7 +113,7 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         )
         .spawn()?;
     for _ in 0..80 {
-        if UnixStream::connect(&socket).is_ok() {
+        if daemon_is_healthy(&socket) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
@@ -118,7 +130,16 @@ pub(crate) fn request(
     request: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     ensure_running(context)?;
-    let mut stream = UnixStream::connect(socket_path(context)?)?;
+    request_existing(context, request)
+}
+
+/// Query an App-owned transport without opening USB or starting a daemon.
+pub(crate) fn request_existing(
+    context: &Context,
+    request: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path(context)?)?;
+    let mut stream = DeadlineUnixStream::new(stream, REQUEST_TIMEOUT)?;
     stream.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
     stream.write_all(request.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -146,7 +167,8 @@ pub(crate) fn stream_request_to(
     output: &mut dyn Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_running(context)?;
-    let mut stream = UnixStream::connect(socket_path(context)?)?;
+    let stream = UnixStream::connect(socket_path(context)?)?;
+    let mut stream = DeadlineUnixStream::new(stream, STREAM_IDLE_TIMEOUT)?;
     stream.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
     stream.write_all(request.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -185,8 +207,8 @@ fn decode_stream(
     }
 }
 
-struct FramedWriter<'a>(&'a mut UnixStream);
-impl Write for FramedWriter<'_> {
+struct FramedWriter<'a, W: Write + ?Sized>(&'a mut W);
+impl<W: Write + ?Sized> Write for FramedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
@@ -202,15 +224,15 @@ impl Write for FramedWriter<'_> {
     }
 }
 
-struct FramedReader<'a> {
-    stream: &'a mut UnixStream,
+struct FramedReader<'a, R: Read + ?Sized> {
+    stream: &'a mut R,
     frame: Vec<u8>,
     offset: usize,
     finished: bool,
 }
 
-impl<'a> FramedReader<'a> {
-    fn new(stream: &'a mut UnixStream) -> Self {
+impl<'a, R: Read + ?Sized> FramedReader<'a, R> {
+    fn new(stream: &'a mut R) -> Self {
         Self {
             stream,
             frame: Vec::new(),
@@ -220,7 +242,7 @@ impl<'a> FramedReader<'a> {
     }
 }
 
-impl Read for FramedReader<'_> {
+impl<R: Read + ?Sized> Read for FramedReader<'_, R> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         if output.is_empty() {
             return Ok(0);
@@ -253,8 +275,8 @@ impl Read for FramedReader<'_> {
     }
 }
 
-fn input_stream_operation(
-    stream: &mut UnixStream,
+fn input_stream_operation<S: Read + Write>(
+    stream: &mut S,
     operation: impl FnOnce(&mut dyn Read) -> adb_client::Result<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(b"OK\n")?;
@@ -266,8 +288,8 @@ fn input_stream_operation(
     Ok(())
 }
 
-fn stream_operation(
-    stream: &mut UnixStream,
+fn stream_operation<S: Read + Write>(
+    stream: &mut S,
     operation: impl FnOnce(&mut dyn Write) -> adb_client::Result<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(b"OK\n")?;
@@ -321,20 +343,8 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let active_requests = Arc::new(AtomicUsize::new(0));
     while device.is_alive() {
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                // Darwin accepts inherit O_NONBLOCK from the listener. Service
-                // streams need blocking backpressure for large binary downloads.
-                stream
-                    .set_nonblocking(false)
-                    .map_err(|error| format!("accepted socket blocking setup failed: {error}"))?;
-                // Darwin rejects SO_RCVTIMEO/SO_SNDTIMEO on AF_UNIX sockets
-                // with EINVAL. The USB transport itself retains its I/O
-                // deadlines; only apply socket timeouts on supported hosts.
-                #[cfg(not(target_os = "macos"))]
-                {
-                    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-                    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-                }
+            Ok((stream, _)) => {
+                let mut stream = DeadlineUnixStream::new(stream, CONTROL_HEADER_TIMEOUT)?;
                 last_request = Instant::now();
                 let active = Arc::clone(&active_requests);
                 let reserved = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -371,7 +381,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle(
     device: Arc<ADBDispatchedUSBDevice>,
-    stream: &mut UnixStream,
+    stream: &mut DeadlineUnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut length = [0; 4];
     stream.read_exact(&mut length)?;
@@ -381,6 +391,7 @@ fn handle(
     }
     let mut request = vec![0; length];
     stream.read_exact(&mut request)?;
+    stream.set_timeout(STREAM_IDLE_TIMEOUT);
     let request = String::from_utf8(request)?;
     let mut fields = request.split('\t');
     let command = fields.next().ok_or("empty daemon request")?;

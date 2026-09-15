@@ -8,6 +8,7 @@ use crate::{
 pub const AUTH_TOKEN: u32 = 1;
 pub const AUTH_SIGNATURE: u32 = 2;
 pub const AUTH_RSAPUBLICKEY: u32 = 3;
+const MAX_ADB_MESSAGE_PAYLOAD: u32 = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ADBTransportMessage {
@@ -55,6 +56,21 @@ impl ADBTransportMessageHeader {
 
     pub const fn data_crc32(&self) -> u32 {
         self.data_crc32
+    }
+
+    pub(crate) fn validate_before_payload(&self) -> Result<()> {
+        if self.magic != Self::compute_magic(self.command) {
+            return Err(RustADBError::ADBRequestFailed(
+                "invalid ADB message magic".to_owned(),
+            ));
+        }
+        if self.data_length > MAX_ADB_MESSAGE_PAYLOAD {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "ADB message payload exceeds {MAX_ADB_MESSAGE_PAYLOAD} bytes: {}",
+                self.data_length
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn compute_crc32(data: &[u8]) -> u32 {
@@ -155,5 +171,48 @@ impl TryFrom<[u8; 24]> for ADBTransportMessageHeader {
 
     fn try_from(value: [u8; 24]) -> Result<Self> {
         Self::decode(&value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(data_length: u32, magic: u32) -> ADBTransportMessageHeader {
+        ADBTransportMessageHeader {
+            command: MessageCommand::Write,
+            arg0: 1,
+            arg1: 2,
+            data_length,
+            data_crc32: 0,
+            magic,
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_magic_before_reading_payload() {
+        let error = header(0, 0).validate_before_payload().unwrap_err();
+        assert!(error.to_string().contains("invalid ADB message magic"));
+    }
+
+    #[test]
+    fn rejects_oversized_payload_before_allocation() {
+        let error = header(
+            MAX_ADB_MESSAGE_PAYLOAD + 1,
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Write),
+        )
+        .validate_before_payload()
+        .unwrap_err();
+        assert!(error.to_string().contains("payload exceeds"));
+    }
+
+    #[test]
+    fn accepts_the_advertised_maximum_payload() {
+        header(
+            MAX_ADB_MESSAGE_PAYLOAD,
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Write),
+        )
+        .validate_before_payload()
+        .unwrap();
     }
 }

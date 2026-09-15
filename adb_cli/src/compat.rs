@@ -19,8 +19,46 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
+
+const MAX_CONCURRENT_WIRELESS_PROBES: usize = 3;
+const DIRECT_ADB_FEATURES: &str = "";
+
+fn bounded_parallel_map<T, U, F>(items: &[T], limit: usize, operation: F) -> Vec<U>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> U + Sync,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let worker_count = limit.max(1).min(items.len());
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut indexed = std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let operation = &operation;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else { return };
+                    if sender.send((index, operation(item))).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        receiver.into_iter().collect::<Vec<_>>()
+    });
+    indexed.sort_unstable_by_key(|(index, _)| *index);
+    indexed.into_iter().map(|(_, output)| output).collect()
+}
 
 fn stable_transport_id(kind: &str, identity: &str) -> u64 {
     kind.bytes()
@@ -54,6 +92,124 @@ fn usb_context(key: &Path, device: &ADBDeviceInfo) -> Context {
     }
 }
 
+fn usb_selector(device: &ADBDeviceInfo) -> String {
+    format!(
+        "usb-{:04x}:{:04x}@{:016x}",
+        device.vendor_id,
+        device.product_id,
+        device.location_id.unwrap_or(0)
+    )
+}
+
+fn parse_usb_selector(value: &str) -> Option<(u16, u16, u64)> {
+    let (ids, location) = value.strip_prefix("usb-")?.split_once('@')?;
+    let (vendor, product) = ids.split_once(':')?;
+    let location = u64::from_str_radix(location, 16).ok()?;
+    (location != 0).then_some((
+        u16::from_str_radix(vendor, 16).ok()?,
+        u16::from_str_radix(product, 16).ok()?,
+        location,
+    ))
+}
+
+fn server_selector(device: &DeviceLong) -> String {
+    format!("mab-server-{}:{}", device.transport_id, device.identifier)
+}
+
+fn parse_server_selector(value: &str) -> Option<(u64, &str)> {
+    let (id, serial) = value.strip_prefix("mab-server-")?.split_once(':')?;
+    (!serial.is_empty()).then_some((id.parse().ok()?, serial))
+}
+
+fn usb_listing(device: &ADBDeviceInfo, details: Result<String, String>) -> String {
+    let identity = if device.location_id.is_some() {
+        usb_selector(device)
+    } else {
+        device
+            .serial
+            .clone()
+            .unwrap_or_else(|| usb_selector(device))
+    };
+    let metadata = format!(
+        "transport_id:{} mab_usb:{:04x}:{:04x}@{:016x}",
+        usb_transport_id(device),
+        device.vendor_id,
+        device.product_id,
+        device.location_id.unwrap_or(0)
+    );
+    match details {
+        Ok(details) => {
+            let mut values = details.lines();
+            let serial = values
+                .next()
+                .unwrap_or("")
+                .replace(char::is_whitespace, "_");
+            let model = values
+                .next()
+                .unwrap_or("")
+                .replace(char::is_whitespace, "_");
+            format!("{identity}\tdevice model:{model} mab_serial:{serial} {metadata}")
+        }
+        Err(error) => {
+            let lower = error.to_lowercase();
+            let state = if lower.contains("unauthorized") || lower.contains("authorization") {
+                "unauthorized"
+            } else if lower.contains("0xe00002c5")
+                || lower.contains("exclusive access")
+                || lower.contains("resource busy")
+            {
+                "usb_busy"
+            } else {
+                "offline"
+            };
+            eprintln!("adb_client: {identity}: {error}");
+            format!("{identity}\t{state} {metadata}")
+        }
+    }
+}
+
+fn list_usb_transports(key: &Path, existing_only: bool) -> Vec<String> {
+    let devices = match find_all_connected_adb_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            eprintln!("adb_client: USB discovery failed: {error}");
+            return vec![];
+        }
+    };
+    let mut output = Vec::new();
+    // Bound authentication work, while keeping a failed phone local to its row.
+    for batch in devices.chunks(3) {
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = batch
+                .iter()
+                .map(|device| {
+                    scope.spawn(move || {
+                        let context = usb_context(key, device);
+                        let result = if existing_only {
+                            direct_daemon::request_existing(&context, "DEVICE_INFO")
+                        } else {
+                            direct_daemon::request(&context, "DEVICE_INFO")
+                        };
+                        if existing_only && result.is_err() {
+                            return None;
+                        }
+                        Some(usb_listing(
+                            device,
+                            result.map_err(|error| error.to_string()),
+                        ))
+                    })
+                })
+                .collect();
+            for task in tasks {
+                if let Ok(Some(row)) = task.join() {
+                    output.push(row);
+                }
+            }
+        });
+    }
+    output
+}
+
 fn wireless_endpoints_path(key: &Path) -> PathBuf {
     key.with_file_name("wireless-endpoints")
 }
@@ -65,27 +221,72 @@ fn wireless_endpoints(key: &Path) -> Result<BTreeSet<SocketAddr>, Box<dyn std::e
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(error) => return Err(error.into()),
     };
-    content
+    let mut endpoints = BTreeSet::new();
+    for line in content
         .lines()
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .map_err(Into::into)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        match line.parse() {
+            Ok(endpoint) => {
+                endpoints.insert(endpoint);
+            }
+            Err(error) => {
+                eprintln!("adb_client: ignoring invalid saved wireless endpoint {line:?}: {error}");
+            }
+        }
+    }
+    Ok(endpoints)
 }
 
-fn save_wireless_endpoints(
+fn publish_wireless_endpoints(
     key: &Path,
     endpoints: &BTreeSet<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    static NEXT_TEMPORARY: AtomicUsize = AtomicUsize::new(0);
     let path = wireless_endpoints_path(key);
+    let temporary = path.with_file_name(format!(
+        ".wireless-endpoints.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
+    options.write(true).create_new(true).mode(0o600);
     use std::io::Write;
-    let mut file = options.open(path)?;
-    for endpoint in endpoints {
-        writeln!(file, "{endpoint}")?;
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        for endpoint in endpoints {
+            writeln!(file, "{endpoint}")?;
+        }
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
     }
-    file.sync_all()?;
-    Ok(())
+    result
+}
+
+fn update_wireless_endpoints<T>(
+    key: &Path,
+    update: impl FnOnce(&mut BTreeSet<SocketAddr>) -> T,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let path = wireless_endpoints_path(key);
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    let mut endpoints = wireless_endpoints(key)?;
+    let output = update(&mut endpoints);
+    publish_wireless_endpoints(key, &endpoints)?;
+    Ok(output)
 }
 
 fn connect_wireless(address: SocketAddr, key: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -97,6 +298,18 @@ fn connect_wireless(address: SocketAddr, key: &Path) -> Result<String, Box<dyn s
         address.to_string()
     } else {
         serial
+    })
+}
+
+fn probe_wireless_transports(
+    addresses: &[SocketAddr],
+    key: &Path,
+) -> Vec<(SocketAddr, Result<String, String>)> {
+    bounded_parallel_map(addresses, MAX_CONCURRENT_WIRELESS_PROBES, |address| {
+        (
+            *address,
+            connect_wireless(*address, key).map_err(|error| error.to_string()),
+        )
     })
 }
 
@@ -934,9 +1147,9 @@ fn run_wireless_device_command(
     let mut device = ADBTcpDevice::new_with_custom_private_key(address, key)?;
     match args.first().map(String::as_str) {
         Some("features") if args.len() == 1 => {
-            // Keep this identical to USB: Sync v2 is available, while zstd is
-            // deliberately not advertised until compressed framing exists.
-            println!("shell_v2,cmd,sendrecv_v2");
+            // Direct wireless currently uses legacy shell and sync framing.
+            // Never advertise protocol variants that callers cannot rely on.
+            println!("{DIRECT_ADB_FEATURES}");
         }
         Some("get-state") if args.len() == 1 => println!("device"),
         Some("get-serialno") if args.len() == 1 => println!("{address}"),
@@ -1232,6 +1445,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             location,
         ));
     }
+    let mut named_server_transport = false;
+    if let Some(value) = serial.clone() {
+        if value.starts_with("usb-") && value.contains('@') {
+            let (vendor, product, location) =
+                parse_usb_selector(&value).ok_or("invalid USB transport selector")?;
+            endpoint = Some((vendor, product, Some(location)));
+            serial = None;
+        } else if value.starts_with("mab-server-") {
+            let (id, expected_serial) =
+                parse_server_selector(&value).ok_or("invalid server transport selector")?;
+            selected_transport_id = Some(id);
+            serial = Some(expected_serial.to_owned());
+            named_server_transport = true;
+        }
+    }
     match args.first().map(String::as_str) {
         Some("pair") if args.len() == 3 => {
             let address: SocketAddr = args[1].parse()?;
@@ -1242,27 +1470,23 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         Some("connect") if args.len() == 2 => {
             let address: SocketAddr = args[1].parse()?;
             let serial = connect_wireless(address, &key)?;
-            let mut endpoints = wireless_endpoints(&key)?;
-            endpoints.insert(address);
-            save_wireless_endpoints(&key, &endpoints)?;
+            update_wireless_endpoints(&key, |endpoints| {
+                endpoints.insert(address);
+            })?;
             println!("connected to {address} ({serial})");
             return Ok(());
         }
         Some("disconnect") if args.len() <= 2 => {
-            let mut endpoints = wireless_endpoints(&key)?;
-            if let Some(value) = args.get(1) {
-                if value != "-a" {
-                    endpoints.remove(&value.parse()?);
-                    println!("disconnected {value}");
-                } else {
-                    endpoints.clear();
-                    println!("disconnected everything");
-                }
+            if let Some(value) = args.get(1).filter(|value| value.as_str() != "-a") {
+                let address = value.parse()?;
+                update_wireless_endpoints(&key, |endpoints| {
+                    endpoints.remove(&address);
+                })?;
+                println!("disconnected {value}");
             } else {
-                endpoints.clear();
+                update_wireless_endpoints(&key, BTreeSet::clear)?;
                 println!("disconnected everything");
             }
-            save_wireless_endpoints(&key, &endpoints)?;
             return Ok(());
         }
         Some("mdns") if args.get(1).map(String::as_str) == Some("check") && args.len() == 2 => {
@@ -1314,29 +1538,41 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         println!("ADB server available at {address}");
         return Ok(());
     }
-    if args.first().map(String::as_str) == Some("devices")
-        && let Some((_, server_devices)) = &server
-    {
+    if args.first().map(String::as_str) == Some("devices") {
         if args.len() > 2 || args.get(1).is_some_and(|option| option != "-l") {
             return Err("usage: adb devices [-l]".into());
         }
         println!("List of devices attached");
         let mut identifiers = BTreeSet::new();
-        for device in server_devices {
-            identifiers.insert(device.identifier.clone());
-            if args.get(1).map(String::as_str) == Some("-l") {
-                println!("{device} mab_transport:server");
-            } else {
-                println!("{}\t{}", device.identifier, device.state);
+        if let Some((_, server_devices)) = &server {
+            for device in server_devices {
+                identifiers.insert(device.identifier.clone());
+                println!(
+                    "{}\t{} model:{} transport_id:{} mab_transport:server mab_serial:{}",
+                    server_selector(device),
+                    device.state,
+                    device.model,
+                    device.transport_id,
+                    device.identifier
+                );
             }
+        }
+        // An existing server owns new USB attachments. Only query already
+        // authenticated App daemons in that case, without competing for USB.
+        let existing_only = server
+            .as_ref()
+            .is_some_and(|(_, devices)| !devices.is_empty());
+        for row in list_usb_transports(&key, existing_only) {
+            println!("{row}");
         }
         // Preserve adb_client-managed wireless endpoints that are not also
         // registered in the developer-owned ADB server.
-        for address in wireless_endpoints(&key)? {
-            if identifiers.contains(&address.to_string()) {
-                continue;
-            }
-            match connect_wireless(address, &key) {
+        let wireless_addresses: Vec<_> = wireless_endpoints(&key)?
+            .into_iter()
+            .filter(|address| !identifiers.contains(&address.to_string()))
+            .collect();
+        for (address, result) in probe_wireless_transports(&wireless_addresses, &key) {
+            match result {
                 Ok(serial) => println!(
                     "{address}\tdevice product:wireless model:{serial} transport_id:{}",
                     stable_transport_id("tcp", &address.to_string())
@@ -1394,6 +1630,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 "multiple devices connected through ADB server; select one with -s or -t".into(),
             );
         }
+    }
+    if named_server_transport {
+        return Err(
+            "selected ADB server transport is no longer connected; refresh the device list".into(),
+        );
     }
     if endpoint.is_none()
         && let Some(address) = serial
@@ -1472,42 +1713,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
-    if args.first().map(String::as_str) == Some("devices") {
-        if args.len() > 2 || args.get(1).is_some_and(|option| option != "-l") {
-            return Err("usage: adb devices [-l]".into());
-        }
-        println!("List of devices attached");
-        for device in devices {
-            let context = usb_context(&key, &device);
-            let details = direct_daemon::request(&context, "DEVICE_INFO")?;
-            let mut values = details.lines();
-            let identifier = values.next().ok_or("missing serial")?;
-            let model = values.next().unwrap_or("").replace(' ', "_");
-            let product = values.next().unwrap_or("");
-            println!(
-                "{identifier}\tdevice product:{product} model:{model} transport_id:{}",
-                usb_transport_id(&device)
-            );
-        }
-        for address in wireless_endpoints(&key)? {
-            match connect_wireless(address, &key) {
-                Ok(serial) => println!(
-                    "{address}\tdevice product:wireless model:{serial} transport_id:{}",
-                    stable_transport_id("tcp", &address.to_string())
-                ),
-                Err(_) => println!(
-                    "{address}\toffline transport_id:{}",
-                    stable_transport_id("tcp", &address.to_string())
-                ),
-            }
-        }
-        return Ok(());
-    }
-
     if args.first().map(String::as_str) == Some("features") {
-        // The direct client currently exposes shell v2 and basic sync. It does
-        // not implement compressed sync framing, so never advertise zstd.
-        println!("shell_v2,cmd,sendrecv_v2");
+        // Direct USB currently uses legacy shell and sync framing. Advertising
+        // shell_v2/sendrecv_v2 would let callers select unsupported framing.
+        println!("{DIRECT_ADB_FEATURES}");
         return Ok(());
     }
     // `adb -s` takes the serial presented to callers, which is obtained from
@@ -1698,9 +1907,81 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompatTransferDevice, ForwardRequest, TransferOptions, TransferRequest,
-        check_pull_ancestors, create_pull_temporary, parse_forward_request, push_compatible,
+        CompatTransferDevice, DIRECT_ADB_FEATURES, ForwardRequest, TransferOptions,
+        TransferRequest, bounded_parallel_map, check_pull_ancestors, create_pull_temporary,
+        parse_forward_request, push_compatible, update_wireless_endpoints, wireless_endpoints,
+        wireless_endpoints_path,
     };
+
+    #[test]
+    fn bounded_parallel_map_limits_workers_and_preserves_order() {
+        let items: Vec<_> = (0..12).collect();
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let output = bounded_parallel_map(&items, 3, |item| {
+            let current = active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            peak.fetch_max(current, std::sync::atomic::Ordering::AcqRel);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            item * 2
+        });
+        assert_eq!(output, (0..12).map(|value| value * 2).collect::<Vec<_>>());
+        assert!(peak.load(std::sync::atomic::Ordering::Acquire) <= 3);
+        assert!(peak.load(std::sync::atomic::Ordering::Acquire) > 1);
+    }
+
+    #[test]
+    fn direct_features_do_not_claim_unimplemented_protocols() {
+        assert!(!DIRECT_ADB_FEATURES.contains("shell_v2"));
+        assert!(!DIRECT_ADB_FEATURES.contains("sendrecv_v2"));
+    }
+
+    #[test]
+    fn wireless_endpoint_updates_are_locked_atomic_and_tolerate_bad_lines() {
+        let directory = std::env::temp_dir().join(format!(
+            "adb-cli-endpoints-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let key = directory.join("adbkey");
+        let workers = 8;
+        let barrier = std::sync::Barrier::new(workers);
+        std::thread::scope(|scope| {
+            for index in 0..workers {
+                let key = &key;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let address = format!("127.0.0.1:{}", 40000 + index).parse().unwrap();
+                    update_wireless_endpoints(key, |endpoints| {
+                        endpoints.insert(address);
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(wireless_endpoints(&key).unwrap().len(), workers);
+        assert!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+
+        fs::write(
+            wireless_endpoints_path(&key),
+            "127.0.0.1:40100\ninvalid endpoint\n",
+        )
+        .unwrap();
+        let endpoints = wireless_endpoints(&key).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert!(endpoints.contains(&"127.0.0.1:40100".parse().unwrap()));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[derive(Default)]
     struct TransferMock {
@@ -1848,6 +2129,55 @@ mod tests {
         assert_ne!(usb, stable_transport_id("usb", "0000000001200000"));
         assert_ne!(usb, stable_transport_id("tcp", "0000000001100000"));
         assert_ne!(usb, 0);
+    }
+
+    #[test]
+    fn duplicate_serial_usb_devices_have_distinct_routes() {
+        use super::{parse_usb_selector, usb_listing};
+        let first = adb_client::usb::ADBDeviceInfo {
+            vendor_id: 0x18d1,
+            product_id: 0x4ee7,
+            location_id: Some(0x01100000),
+            serial: Some("SAME".into()),
+            device_description: String::new(),
+        };
+        let second = adb_client::usb::ADBDeviceInfo {
+            location_id: Some(0x01200000),
+            ..first.clone()
+        };
+        let a = usb_listing(&first, Ok("SAME\nPhone A\nproduct".into()));
+        let b = usb_listing(&second, Ok("SAME\nPhone B\nproduct".into()));
+        assert_ne!(a.split_whitespace().next(), b.split_whitespace().next());
+        assert_eq!(
+            parse_usb_selector(a.split_whitespace().next().unwrap()),
+            Some((0x18d1, 0x4ee7, 0x01100000))
+        );
+        assert_eq!(
+            parse_usb_selector(b.split_whitespace().next().unwrap()),
+            Some((0x18d1, 0x4ee7, 0x01200000))
+        );
+        assert!(parse_usb_selector("usb-18d1:4ee7@0").is_none());
+        assert!(usb_listing(&first, Err("unauthorized".into())).contains("\tunauthorized "));
+        assert!(usb_listing(&second, Err("0xe00002c5".into())).contains("\tusb_busy "));
+    }
+
+    #[test]
+    fn server_selector_preserves_transport_and_expected_serial() {
+        use super::parse_server_selector;
+        assert_eq!(
+            parse_server_selector("mab-server-7:SAME"),
+            Some((7, "SAME"))
+        );
+        assert_eq!(
+            parse_server_selector("mab-server-8:SAME"),
+            Some((8, "SAME"))
+        );
+        assert_eq!(
+            parse_server_selector("mab-server-9:[fe80::1]:5555"),
+            Some((9, "[fe80::1]:5555"))
+        );
+        assert!(parse_server_selector("mab-server-7:").is_none());
+        assert!(parse_server_selector("mab-server-invalid:SAME").is_none());
     }
 
     #[test]

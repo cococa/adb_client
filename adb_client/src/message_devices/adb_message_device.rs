@@ -10,7 +10,7 @@ use crate::{
             ADBTransportMessage, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN,
         },
         message_commands::{MessageCommand, MessageSubcommand},
-        models::{ADBRsaKey, read_adb_private_key},
+        models::{ADBRsaKey, load_or_create_adb_private_key},
         utils::BinaryEncodable,
     },
     models::ADBLocalCommand,
@@ -26,17 +26,7 @@ pub struct ADBMessageDevice<T: ADBMessageTransport> {
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// Instantiate a new [`ADBMessageDevice`]
     pub fn new<P: AsRef<Path>>(transport: T, adb_private_key_path: P) -> Result<Self> {
-        let private_key = if let Some(private_key) = read_adb_private_key(&adb_private_key_path)? {
-            private_key
-        } else {
-            log::warn!(
-                "No private key found at path {}. Generating a new random.",
-                adb_private_key_path.as_ref().display()
-            );
-            let private_key = ADBRsaKey::new_random()?;
-            private_key.write_pkcs8(&adb_private_key_path)?;
-            private_key
-        };
+        let private_key = load_or_create_adb_private_key(&adb_private_key_path)?;
 
         let mut message_device = Self { transport };
         message_device.connect(&private_key)?;
@@ -80,7 +70,11 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         self.get_transport_mut().write_message(message)?;
 
-        let message = self.get_transport_mut().read_message()?;
+        // A connected socket that never speaks ADB must not stall device
+        // discovery or daemon startup indefinitely.
+        let message = self
+            .get_transport_mut()
+            .read_message_with_timeout(Duration::from_secs(5))?;
 
         // Check if a client is requesting a secure connection and upgrade it if necessary
         match message.header().command() {
