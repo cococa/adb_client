@@ -15,6 +15,7 @@ use adb_client::{
 use std::{
     collections::BTreeSet,
     fs,
+    io::{BufRead, BufReader},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -1200,9 +1201,16 @@ fn run_wireless_device_command(
         }
         Some("reverse") if args.len() == 3 => {
             // The relay must own its TCP ADB transport for as long as scrcpy
-            // is connected. Run the existing native TCP relay as a managed
-            // child instead of returning after installing a short-lived rule.
-            Command::new(std::env::current_exe()?)
+            // is connected. Do not report success before that child has
+            // authenticated and is ready: scrcpy starts its Android server as
+            // soon as `adb reverse` returns, and otherwise the server races
+            // the relay with a connection-refused failure.
+            eprintln!(
+                "[MAB-WIRELESS-REVERSE] spawning relay device={address} remote={} local={}",
+                args[1], args[2]
+            );
+            drop(device);
+            let mut relay = Command::new(std::env::current_exe()?)
                 .arg("tcp")
                 .arg(address.to_string())
                 .arg("--private-key")
@@ -1211,10 +1219,31 @@ fn run_wireless_device_command(
                 .arg(&args[1])
                 .arg(&args[2])
                 .env_remove("MACANDROIDBRIDGE_ADB_KEY")
+                .env("MACANDROIDBRIDGE_REVERSE_RELAY_READY", "1")
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::piped())
+                // Keep diagnostics attached to scrcpy's stderr so they appear
+                // in the existing MirrorDebug/Xcode stream after this short-
+                // lived compatibility process exits.
+                .stderr(Stdio::inherit())
                 .spawn()?;
+            let stdout = relay
+                .stdout
+                .take()
+                .ok_or("wireless reverse relay did not expose readiness output")?;
+            let mut ready_line = String::new();
+            BufReader::new(stdout).read_line(&mut ready_line)?;
+            if ready_line.trim() != "MAB_REVERSE_RELAY_READY" {
+                let status = relay.wait()?;
+                return Err(format!(
+                    "wireless reverse relay failed before becoming ready (status {status})"
+                )
+                .into());
+            }
+            eprintln!(
+                "[MAB-WIRELESS-REVERSE] relay acknowledged ready pid={} device={address}",
+                relay.id()
+            );
         }
         _ => return Err(format!("unsupported wireless command: {}", args.join(" ")).into()),
     }

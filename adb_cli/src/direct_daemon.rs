@@ -15,7 +15,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -44,6 +44,10 @@ impl Drop for ActiveRequest {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
+}
+
+fn daemon_should_continue(device_alive: bool, shutdown_requested: bool) -> bool {
+    device_alive && !shutdown_requested
 }
 
 pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -341,7 +345,11 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("control socket nonblocking setup failed: {error}"))?;
     let mut last_request = Instant::now();
     let active_requests = Arc::new(AtomicUsize::new(0));
-    while device.is_alive() {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    while daemon_should_continue(
+        device.is_alive(),
+        shutdown_requested.load(Ordering::Acquire),
+    ) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut stream = DeadlineUnixStream::new(stream, CONTROL_HEADER_TIMEOUT)?;
@@ -355,9 +363,10 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let device = Arc::clone(&device);
+                let shutdown_requested = Arc::clone(&shutdown_requested);
                 thread::spawn(move || {
                     let _active_request = ActiveRequest(active);
-                    if let Err(error) = handle(device, &mut stream) {
+                    if let Err(error) = handle(device, shutdown_requested, &mut stream) {
                         let _ = writeln!(stream, "ERR\t{error}");
                     }
                 });
@@ -381,6 +390,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle(
     device: Arc<ADBDispatchedUSBDevice>,
+    shutdown_requested: Arc<AtomicBool>,
     stream: &mut DeadlineUnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut length = [0; 4];
@@ -483,6 +493,10 @@ fn handle(
             }
         }
         "PING" => {}
+        "SHUTDOWN" => {
+            shutdown_requested.store(true, Ordering::Release);
+            log::debug!("direct USB daemon received explicit shutdown request");
+        }
         "PUSH" => {
             let source = fields.next().ok_or("missing push source")?;
             let destination = fields.next().ok_or("missing push destination")?;
@@ -576,6 +590,14 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_shutdown_stops_daemon_while_device_is_alive() {
+        assert!(daemon_should_continue(true, false));
+        assert!(!daemon_should_continue(true, true));
+        assert!(!daemon_should_continue(false, false));
+    }
+
     #[test]
     fn large_binary_stream_applies_backpressure_without_truncation() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();

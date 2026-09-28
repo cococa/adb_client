@@ -188,7 +188,51 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// this service is available over a direct USB ADB connection and is the
     /// foundation for the scrcpy server's connection back to the Mac.
     pub(crate) fn reverse_forward(&mut self, remote: String, local: String) -> Result<()> {
-        let _session = self.open_session(&ADBLocalCommand::Reverse(remote, local))?;
+        eprintln!("[MAB-WIRELESS-REVERSE] registering remote={remote} local={local}");
+        let mut session = self.open_session(&ADBLocalCommand::Reverse(remote, local))?;
+        let local_id = session.local_id();
+        let remote_id = session.remote_id();
+
+        // Opening the ADB logical stream only confirms that adbd accepted the
+        // service name. The reverse service then sends its actual result as a
+        // WRTE payload and closes the stream. Consume and acknowledge both
+        // packets before advertising the route as ready; otherwise the first
+        // service-result packet is mistaken for a device-initiated relay OPEN.
+        let result = session
+            .get_transport_mut()
+            .read_message_with_timeout(Duration::from_secs(5))?;
+        result.assert_command(MessageCommand::Write)?;
+        let result_text = String::from_utf8_lossy(result.payload()).into_owned();
+        session
+            .get_transport_mut()
+            .write_message(ADBTransportMessage::try_new(
+                MessageCommand::Okay,
+                local_id,
+                remote_id,
+                &[],
+            )?)?;
+        if !result.payload().starts_with(b"OKAY") {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "reverse registration failed: {result_text}"
+            )));
+        }
+
+        let close = session
+            .get_transport_mut()
+            .read_message_with_timeout(Duration::from_secs(5))?;
+        close.assert_command(MessageCommand::Clse)?;
+        session
+            .get_transport_mut()
+            .write_message(ADBTransportMessage::try_new(
+                MessageCommand::Clse,
+                local_id,
+                remote_id,
+                &[],
+            )?)?;
+        eprintln!(
+            "[MAB-WIRELESS-REVERSE] registration confirmed response={}",
+            result_text.trim_end_matches('\0')
+        );
         Ok(())
     }
 

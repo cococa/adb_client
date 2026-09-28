@@ -27,6 +27,21 @@ use crate::{
 const USB_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_ADB_PAYLOAD: usize = 64 * 1024;
 
+fn is_idle_poll_error(error: &RustADBError) -> bool {
+    matches!(
+        error,
+        RustADBError::IOError(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    )
+}
+
+fn is_expected_reverse_destination(destination: &str, local: &str) -> bool {
+    destination == local
+}
+
 #[derive(Debug)]
 enum LocalEvent {
     Data { local_id: u32, payload: Vec<u8> },
@@ -40,8 +55,10 @@ enum LocalEvent {
 pub(crate) struct ReverseRelay<'a, T: ADBMessageTransport> {
     transport: &'a mut T,
     remote: String,
+    local: String,
     local_port: u16,
     sockets: HashMap<u32, (u32, TcpStream)>,
+    accepted_stream: bool,
     event_tx: Sender<LocalEvent>,
     event_rx: Receiver<LocalEvent>,
 }
@@ -63,8 +80,10 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         Ok(Self {
             transport,
             remote,
+            local,
             local_port,
             sockets: HashMap::new(),
+            accepted_stream: false,
             event_tx,
             event_rx,
         })
@@ -73,12 +92,38 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
     /// Runs until the device closes the transport. The short USB read timeout
     /// lets outbound TCP bytes progress even when Android is temporarily idle.
     pub(crate) fn run(&mut self) -> Result<()> {
+        // The scrcpy compatibility process waits for this exact readiness
+        // signal before returning from `adb reverse`. Emit it only after the
+        // relay is fully initialized, immediately before it receives Android
+        // `OPEN` requests, so server startup cannot race the reverse route.
+        if std::env::var_os("MACANDROIDBRIDGE_REVERSE_RELAY_READY").is_some() {
+            eprintln!(
+                "[MAB-WIRELESS-REVERSE] relay ready remote={} local={} local_port={}",
+                self.remote, self.local, self.local_port
+            );
+            println!("MAB_REVERSE_RELAY_READY");
+            std::io::stdout().flush()?;
+        }
         loop {
             self.flush_local_events()?;
+            if self.accepted_stream && self.sockets.is_empty() {
+                eprintln!("[MAB-WIRELESS-REVERSE] all local streams closed; relay exiting");
+                return Ok(());
+            }
             match self.transport.read_message_with_timeout(USB_POLL_TIMEOUT) {
-                Ok(message) => self.handle_device_message(message)?,
-                Err(RustADBError::IOError(error))
-                    if error.kind() == std::io::ErrorKind::TimedOut => {}
+                Ok(message) => {
+                    self.handle_device_message(message)?;
+                    if self.accepted_stream && self.sockets.is_empty() {
+                        eprintln!(
+                            "[MAB-WIRELESS-REVERSE] all device streams closed; relay exiting"
+                        );
+                        return Ok(());
+                    }
+                }
+                // macOS reports a socket receive timeout as EAGAIN/WouldBlock
+                // while other platforms commonly use TimedOut. Both mean the
+                // polling loop is idle, not that the wireless transport died.
+                Err(error) if is_idle_poll_error(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -133,13 +178,31 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         let destination = String::from_utf8_lossy(message.payload())
             .trim_end_matches('\0')
             .to_owned();
-        if destination != self.remote {
+        eprintln!(
+            "[MAB-WIRELESS-REVERSE] received device OPEN destination={destination} expected={} local_port={}",
+            self.local, self.local_port
+        );
+        if !is_expected_reverse_destination(&destination, &self.local) {
             return Err(RustADBError::ADBRequestFailed(format!(
-                "device requested non-configured reverse destination {destination}"
+                "device requested reverse destination {destination}, expected {}",
+                self.local
             )));
         }
-        let stream = TcpStream::connect(("127.0.0.1", self.local_port))?;
+        let stream = TcpStream::connect(("127.0.0.1", self.local_port)).map_err(|error| {
+            eprintln!(
+                "[MAB-WIRELESS-REVERSE] local TCP connect failed port={} error={error}",
+                self.local_port
+            );
+            RustADBError::ADBRequestFailed(format!(
+                "reverse relay could not connect to 127.0.0.1:{}: {error}",
+                self.local_port
+            ))
+        })?;
         stream.set_nodelay(true)?;
+        eprintln!(
+            "[MAB-WIRELESS-REVERSE] local TCP connected port={}",
+            self.local_port
+        );
         let reader = stream.try_clone()?;
         let device_id = message.header().arg0();
         let mut rng = rand::rng();
@@ -151,6 +214,7 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
             &[],
         )?)?;
         self.sockets.insert(local_id, (device_id, stream));
+        self.accepted_stream = true;
         Self::spawn_local_reader(reader, local_id, self.event_tx.clone());
         Ok(())
     }
@@ -182,6 +246,9 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         let local_id = message.header().arg1();
         let remote_id = message.header().arg0();
         self.sockets.remove(&local_id);
+        eprintln!(
+            "[MAB-WIRELESS-REVERSE] device stream closed local_id={local_id} remote_id={remote_id}"
+        );
         self.transport.write_message(ADBTransportMessage::try_new(
             MessageCommand::Clse,
             local_id,
@@ -214,5 +281,38 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_poll_accepts_macos_would_block() {
+        let error = RustADBError::IOError(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+
+        assert!(is_idle_poll_error(&error));
+    }
+
+    #[test]
+    fn idle_poll_rejects_connection_reset() {
+        let error =
+            RustADBError::IOError(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+
+        assert!(!is_idle_poll_error(&error));
+    }
+
+    #[test]
+    fn reverse_open_accepts_registered_local_target() {
+        assert!(is_expected_reverse_destination("tcp:27183", "tcp:27183"));
+    }
+
+    #[test]
+    fn reverse_open_rejects_device_side_socket_name() {
+        assert!(!is_expected_reverse_destination(
+            "localabstract:scrcpy_test",
+            "tcp:27183"
+        ));
     }
 }
