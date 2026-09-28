@@ -188,7 +188,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// this service is available over a direct USB ADB connection and is the
     /// foundation for the scrcpy server's connection back to the Mac.
     pub(crate) fn reverse_forward(&mut self, remote: String, local: String) -> Result<()> {
-        eprintln!("[MAB-WIRELESS-REVERSE] registering remote={remote} local={local}");
+        eprintln!("[ANDROCONNECT-WIRELESS-REVERSE] registering remote={remote} local={local}");
         let mut session = self.open_session(&ADBLocalCommand::Reverse(remote, local))?;
         let local_id = session.local_id();
         let remote_id = session.remote_id();
@@ -230,7 +230,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 &[],
             )?)?;
         eprintln!(
-            "[MAB-WIRELESS-REVERSE] registration confirmed response={}",
+            "[ANDROCONNECT-WIRELESS-REVERSE] registration confirmed response={}",
             result_text.trim_end_matches('\0')
         );
         Ok(())

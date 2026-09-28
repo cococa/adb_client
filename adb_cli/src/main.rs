@@ -146,7 +146,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    if (std::env::var_os("MACANDROIDBRIDGE_ADB_KEY").is_some()
+    if (std::env::var_os("ANDROCONNECT_ADB_KEY").is_some()
         // `adb_cli` is the App-facing executable. Every public command must
         // use the self-contained compatibility layer, including `devices` and
         // `mdns`; only the child relay retains the native `tcp` CLI parser.

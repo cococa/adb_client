@@ -68,7 +68,7 @@ fn ensure_running(context: &Context<'_>) -> Result<(), Box<dyn std::error::Error
     }
     Command::new(std::env::current_exe()?)
         .env("ADB_CLI_WIRELESS_FORWARD_DAEMON", "1")
-        .env("MACANDROIDBRIDGE_ADB_KEY", context.key)
+        .env("ANDROCONNECT_ADB_KEY", context.key)
         .env("ADB_CLI_WIRELESS_ADDRESS", context.address.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -120,7 +120,7 @@ fn request_once(
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let key = std::env::var_os("MACANDROIDBRIDGE_ADB_KEY")
+    let key = std::env::var_os("ANDROCONNECT_ADB_KEY")
         .map(PathBuf::from)
         .ok_or("missing key")?;
     let address: SocketAddr = std::env::var("ADB_CLI_WIRELESS_ADDRESS")?.parse()?;

@@ -114,11 +114,11 @@ fn parse_usb_selector(value: &str) -> Option<(u16, u16, u64)> {
 }
 
 fn server_selector(device: &DeviceLong) -> String {
-    format!("mab-server-{}:{}", device.transport_id, device.identifier)
+    format!("androconnect-server-{}:{}", device.transport_id, device.identifier)
 }
 
 fn parse_server_selector(value: &str) -> Option<(u64, &str)> {
-    let (id, serial) = value.strip_prefix("mab-server-")?.split_once(':')?;
+    let (id, serial) = value.strip_prefix("androconnect-server-")?.split_once(':')?;
     (!serial.is_empty()).then_some((id.parse().ok()?, serial))
 }
 
@@ -132,7 +132,7 @@ fn usb_listing(device: &ADBDeviceInfo, details: Result<String, String>) -> Strin
             .unwrap_or_else(|| usb_selector(device))
     };
     let metadata = format!(
-        "transport_id:{} mab_usb:{:04x}:{:04x}@{:016x}",
+        "transport_id:{} androconnect_usb:{:04x}:{:04x}@{:016x}",
         usb_transport_id(device),
         device.vendor_id,
         device.product_id,
@@ -149,7 +149,7 @@ fn usb_listing(device: &ADBDeviceInfo, details: Result<String, String>) -> Strin
                 .next()
                 .unwrap_or("")
                 .replace(char::is_whitespace, "_");
-            format!("{identity}\tdevice model:{model} mab_serial:{serial} {metadata}")
+            format!("{identity}\tdevice model:{model} androconnect_serial:{serial} {metadata}")
         }
         Err(error) => {
             let lower = error.to_lowercase();
@@ -320,7 +320,7 @@ struct InstallRequest {
     source: String,
 }
 
-/// Parses precisely the install subset used by MacAndRoidBridge. Keeping this
+/// Parses precisely the install subset used by Andro Connect. Keeping this
 /// shared between USB and wireless transports prevents one connection type
 /// from silently accepting a different APK-install request.
 fn parse_install_request(args: &[String]) -> Result<InstallRequest, Box<dyn std::error::Error>> {
@@ -413,7 +413,7 @@ fn install_wireless(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
     let remote = format!(
-        "/data/local/tmp/mab-install-{}-{suffix}.apk",
+        "/data/local/tmp/androconnect-install-{}-{suffix}.apk",
         std::process::id()
     );
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -610,7 +610,7 @@ impl CompatTransferDevice for ServerTransferDevice {
 const DEFAULT_ADB_SERVER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5037);
 
 fn configured_server_address() -> Result<SocketAddrV4, Box<dyn std::error::Error>> {
-    std::env::var("MACANDROIDBRIDGE_ADB_SERVER")
+    std::env::var("ANDROCONNECT_ADB_SERVER")
         .unwrap_or_else(|_| DEFAULT_ADB_SERVER.to_string())
         .parse()
         .map_err(Into::into)
@@ -618,12 +618,12 @@ fn configured_server_address() -> Result<SocketAddrV4, Box<dyn std::error::Error
 
 fn existing_server_devices()
 -> Result<Option<(SocketAddrV4, Vec<DeviceLong>)>, Box<dyn std::error::Error>> {
-    let mode = std::env::var("MACANDROIDBRIDGE_ADB_MODE").unwrap_or_else(|_| "auto".to_owned());
+    let mode = std::env::var("ANDROCONNECT_ADB_MODE").unwrap_or_else(|_| "auto".to_owned());
     if mode == "direct" {
         return Ok(None);
     }
     if !matches!(mode.as_str(), "auto" | "server") {
-        return Err(format!("invalid MACANDROIDBRIDGE_ADB_MODE: {mode}").into());
+        return Err(format!("invalid ANDROCONNECT_ADB_MODE: {mode}").into());
     }
     let address = configured_server_address()?;
     let mut server = ADBServer::new_existing(address);
@@ -1043,7 +1043,7 @@ fn create_pull_temporary(local: &Path) -> Result<(PathBuf, fs::File), Box<dyn st
         let mut bytes = [0u8; 16];
         random.read_exact(&mut bytes)?;
         let path =
-            local.with_file_name(format!(".mab-{:032x}.partial", u128::from_ne_bytes(bytes)));
+            local.with_file_name(format!(".androconnect-{:032x}.partial", u128::from_ne_bytes(bytes)));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1206,7 +1206,7 @@ fn run_wireless_device_command(
             // soon as `adb reverse` returns, and otherwise the server races
             // the relay with a connection-refused failure.
             eprintln!(
-                "[MAB-WIRELESS-REVERSE] spawning relay device={address} remote={} local={}",
+                "[ANDROCONNECT-WIRELESS-REVERSE] spawning relay device={address} remote={} local={}",
                 args[1], args[2]
             );
             drop(device);
@@ -1218,8 +1218,8 @@ fn run_wireless_device_command(
                 .arg("reverse-relay")
                 .arg(&args[1])
                 .arg(&args[2])
-                .env_remove("MACANDROIDBRIDGE_ADB_KEY")
-                .env("MACANDROIDBRIDGE_REVERSE_RELAY_READY", "1")
+                .env_remove("ANDROCONNECT_ADB_KEY")
+                .env("ANDROCONNECT_REVERSE_RELAY_READY", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 // Keep diagnostics attached to scrcpy's stderr so they appear
@@ -1233,7 +1233,7 @@ fn run_wireless_device_command(
                 .ok_or("wireless reverse relay did not expose readiness output")?;
             let mut ready_line = String::new();
             BufReader::new(stdout).read_line(&mut ready_line)?;
-            if ready_line.trim() != "MAB_REVERSE_RELAY_READY" {
+            if ready_line.trim() != "ANDROCONNECT_REVERSE_RELAY_READY" {
                 let status = relay.wait()?;
                 return Err(format!(
                     "wireless reverse relay failed before becoming ready (status {status})"
@@ -1241,7 +1241,7 @@ fn run_wireless_device_command(
                 .into());
             }
             eprintln!(
-                "[MAB-WIRELESS-REVERSE] relay acknowledged ready pid={} device={address}",
+                "[ANDROCONNECT-WIRELESS-REVERSE] relay acknowledged ready pid={} device={address}",
                 relay.id()
             );
         }
@@ -1418,9 +1418,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    let key = std::env::var_os("MACANDROIDBRIDGE_ADB_KEY")
+    let key = std::env::var_os("ANDROCONNECT_ADB_KEY")
         .map(PathBuf::from)
-        .ok_or("MACANDROIDBRIDGE_ADB_KEY is not set")?;
+        .ok_or("ANDROCONNECT_ADB_KEY is not set")?;
     let mut serial = None;
     let mut selected_transport_id = None;
     let mut endpoint = None;
@@ -1481,7 +1481,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 parse_usb_selector(&value).ok_or("invalid USB transport selector")?;
             endpoint = Some((vendor, product, Some(location)));
             serial = None;
-        } else if value.starts_with("mab-server-") {
+        } else if value.starts_with("androconnect-server-") {
             let (id, expected_serial) =
                 parse_server_selector(&value).ok_or("invalid server transport selector")?;
             selected_transport_id = Some(id);
@@ -1577,7 +1577,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             for device in server_devices {
                 identifiers.insert(device.identifier.clone());
                 println!(
-                    "{}\t{} model:{} transport_id:{} mab_transport:server mab_serial:{}",
+                    "{}\t{} model:{} transport_id:{} androconnect_transport:server androconnect_serial:{}",
                     server_selector(device),
                     device.state,
                     device.model,
@@ -2194,19 +2194,19 @@ mod tests {
     fn server_selector_preserves_transport_and_expected_serial() {
         use super::parse_server_selector;
         assert_eq!(
-            parse_server_selector("mab-server-7:SAME"),
+            parse_server_selector("androconnect-server-7:SAME"),
             Some((7, "SAME"))
         );
         assert_eq!(
-            parse_server_selector("mab-server-8:SAME"),
+            parse_server_selector("androconnect-server-8:SAME"),
             Some((8, "SAME"))
         );
         assert_eq!(
-            parse_server_selector("mab-server-9:[fe80::1]:5555"),
+            parse_server_selector("androconnect-server-9:[fe80::1]:5555"),
             Some((9, "[fe80::1]:5555"))
         );
-        assert!(parse_server_selector("mab-server-7:").is_none());
-        assert!(parse_server_selector("mab-server-invalid:SAME").is_none());
+        assert!(parse_server_selector("androconnect-server-7:").is_none());
+        assert!(parse_server_selector("androconnect-server-invalid:SAME").is_none());
     }
 
     #[test]
@@ -2229,7 +2229,7 @@ mod tests {
     #[test]
     fn local_walk_keeps_empty_directories_and_does_not_follow_symlinks() {
         let root = std::env::temp_dir().join(format!(
-            "mab-transfer-test-{}-{}",
+            "androconnect-transfer-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -96,18 +96,18 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         // signal before returning from `adb reverse`. Emit it only after the
         // relay is fully initialized, immediately before it receives Android
         // `OPEN` requests, so server startup cannot race the reverse route.
-        if std::env::var_os("MACANDROIDBRIDGE_REVERSE_RELAY_READY").is_some() {
+        if std::env::var_os("ANDROCONNECT_REVERSE_RELAY_READY").is_some() {
             eprintln!(
-                "[MAB-WIRELESS-REVERSE] relay ready remote={} local={} local_port={}",
+                "[ANDROCONNECT-WIRELESS-REVERSE] relay ready remote={} local={} local_port={}",
                 self.remote, self.local, self.local_port
             );
-            println!("MAB_REVERSE_RELAY_READY");
+            println!("ANDROCONNECT_REVERSE_RELAY_READY");
             std::io::stdout().flush()?;
         }
         loop {
             self.flush_local_events()?;
             if self.accepted_stream && self.sockets.is_empty() {
-                eprintln!("[MAB-WIRELESS-REVERSE] all local streams closed; relay exiting");
+                eprintln!("[ANDROCONNECT-WIRELESS-REVERSE] all local streams closed; relay exiting");
                 return Ok(());
             }
             match self.transport.read_message_with_timeout(USB_POLL_TIMEOUT) {
@@ -115,7 +115,7 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
                     self.handle_device_message(message)?;
                     if self.accepted_stream && self.sockets.is_empty() {
                         eprintln!(
-                            "[MAB-WIRELESS-REVERSE] all device streams closed; relay exiting"
+                            "[ANDROCONNECT-WIRELESS-REVERSE] all device streams closed; relay exiting"
                         );
                         return Ok(());
                     }
@@ -179,7 +179,7 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
             .trim_end_matches('\0')
             .to_owned();
         eprintln!(
-            "[MAB-WIRELESS-REVERSE] received device OPEN destination={destination} expected={} local_port={}",
+            "[ANDROCONNECT-WIRELESS-REVERSE] received device OPEN destination={destination} expected={} local_port={}",
             self.local, self.local_port
         );
         if !is_expected_reverse_destination(&destination, &self.local) {
@@ -190,7 +190,7 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         }
         let stream = TcpStream::connect(("127.0.0.1", self.local_port)).map_err(|error| {
             eprintln!(
-                "[MAB-WIRELESS-REVERSE] local TCP connect failed port={} error={error}",
+                "[ANDROCONNECT-WIRELESS-REVERSE] local TCP connect failed port={} error={error}",
                 self.local_port
             );
             RustADBError::ADBRequestFailed(format!(
@@ -200,7 +200,7 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         })?;
         stream.set_nodelay(true)?;
         eprintln!(
-            "[MAB-WIRELESS-REVERSE] local TCP connected port={}",
+            "[ANDROCONNECT-WIRELESS-REVERSE] local TCP connected port={}",
             self.local_port
         );
         let reader = stream.try_clone()?;
@@ -247,7 +247,7 @@ impl<'a, T: ADBMessageTransport> ReverseRelay<'a, T> {
         let remote_id = message.header().arg0();
         self.sockets.remove(&local_id);
         eprintln!(
-            "[MAB-WIRELESS-REVERSE] device stream closed local_id={local_id} remote_id={remote_id}"
+            "[ANDROCONNECT-WIRELESS-REVERSE] device stream closed local_id={local_id} remote_id={remote_id}"
         );
         self.transport.write_message(ADBTransportMessage::try_new(
             MessageCommand::Clse,

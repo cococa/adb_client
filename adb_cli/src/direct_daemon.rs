@@ -102,7 +102,7 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
     }
     Command::new(std::env::current_exe()?)
         .env("ADB_CLI_DIRECT_DAEMON", "1")
-        .env("MACANDROIDBRIDGE_ADB_KEY", &context.key)
+        .env("ANDROCONNECT_ADB_KEY", &context.key)
         .env("ADB_CLI_VENDOR", context.vendor.to_string())
         .env("ADB_CLI_PRODUCT", context.product.to_string())
         .env("ADB_CLI_LOCATION", context.location.to_string())
@@ -310,7 +310,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The compatibility daemon bypasses clap's normal logger setup.
     let _ = env_logger::try_init();
     let context = Context {
-        key: std::env::var_os("MACANDROIDBRIDGE_ADB_KEY")
+        key: std::env::var_os("ANDROCONNECT_ADB_KEY")
             .map(PathBuf::from)
             .ok_or("missing key")?,
         vendor: std::env::var("ADB_CLI_VENDOR")?.parse()?,
@@ -436,7 +436,7 @@ fn handle(
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos();
             let remote = format!(
-                "/data/local/tmp/mab-install-{}-{suffix}.apk",
+                "/data/local/tmp/androconnect-install-{}-{suffix}.apk",
                 std::process::id()
             );
             let result = (|| -> adb_client::Result<()> {
