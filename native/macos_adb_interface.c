@@ -16,6 +16,7 @@ typedef struct {
     uint16_t vendor_id;
     uint16_t product_id;
     uint64_t location_id;
+    uint64_t registry_id;
 } macadb_device_info;
 
 static int property_u16(io_registry_entry_t service, CFStringRef key, UInt16 *value) {
@@ -72,6 +73,8 @@ int macadb_list(macadb_device_info **output, size_t *count) {
     while ((service = IOIteratorNext(iterator))) {
         UInt16 vendor = 0, product = 0;
         uint64_t location = device_location_id(service);
+        uint64_t registry_id = 0;
+        IORegistryEntryGetRegistryEntryID(service, &registry_id);
         UInt16 klass = 0, subclass = 0, protocol = 0;
         int is_adb = property_u16(service, CFSTR("bInterfaceClass"), &klass)
             && property_u16(service, CFSTR("bInterfaceSubClass"), &subclass)
@@ -80,7 +83,7 @@ int macadb_list(macadb_device_info **output, size_t *count) {
             && property_u16(service, CFSTR("idVendor"), &vendor)
             && property_u16(service, CFSTR("idProduct"), &product);
         IOObjectRelease(service);
-        if (!is_adb) continue;
+        if (!is_adb || registry_id == 0) continue;
 
         int duplicate = 0;
         for (size_t index = 0; index < *count; index++) {
@@ -101,7 +104,7 @@ int macadb_list(macadb_device_info **output, size_t *count) {
             devices = next;
             capacity = next_capacity;
         }
-        devices[*count] = (macadb_device_info) { vendor, product, location };
+        devices[*count] = (macadb_device_info) { vendor, product, location, registry_id };
         *count += 1;
     }
     IOObjectRelease(iterator);
@@ -112,7 +115,7 @@ int macadb_list(macadb_device_info **output, size_t *count) {
 void macadb_list_free(macadb_device_info *devices) { free(devices); }
 
 int macadb_open(uint16_t wanted_vendor, uint16_t wanted_product,
-        uint64_t wanted_location, macadb_interface **output) {
+        uint64_t wanted_location, uint64_t wanted_registry_id, macadb_interface **output) {
     *output = NULL;
     CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBInterfaceClassName);
     io_iterator_t iterator = 0;
@@ -124,10 +127,13 @@ int macadb_open(uint16_t wanted_vendor, uint16_t wanted_product,
     while ((service = IOIteratorNext(iterator))) {
         UInt16 vendor = 0, product = 0;
         uint64_t location = device_location_id(service);
+        uint64_t registry_id = 0;
+        IORegistryEntryGetRegistryEntryID(service, &registry_id);
         if (!property_u16(service, CFSTR("idVendor"), &vendor)
             || !property_u16(service, CFSTR("idProduct"), &product)
             || vendor != wanted_vendor || product != wanted_product
-            || (wanted_location != 0 && location != wanted_location)) {
+            || (wanted_location != 0 && location != wanted_location)
+            || (wanted_registry_id != 0 && registry_id != wanted_registry_id)) {
             IOObjectRelease(service);
             continue;
         }

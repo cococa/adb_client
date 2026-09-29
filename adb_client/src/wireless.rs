@@ -60,6 +60,33 @@ pub fn pair(address: SocketAddr, pairing_code: &str, key_path: &Path) -> Result<
     if pairing_code.len() != 6 || !pairing_code.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(failure("pairing code must contain exactly six digits"));
     }
+    pair_with_secret(address, pairing_code, key_path)
+}
+
+/// Pairs using a QR secret read from a private input pipe, without exposing it in argv.
+/// The pipe must contain 1–64 printable ASCII bytes followed by EOF (no newline).
+pub fn pair_with_password_from_reader(
+    address: SocketAddr,
+    reader: impl Read,
+    key_path: &Path,
+) -> Result<String> {
+    let password = read_pairing_password(reader)?;
+    pair_with_secret(address, &password, key_path)
+}
+
+fn read_pairing_password(reader: impl Read) -> Result<Zeroizing<String>> {
+    let mut password = Zeroizing::new(String::new());
+    reader.take(65).read_to_string(&mut password)?;
+    if password.is_empty()
+        || password.len() > 64
+        || !password.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(failure("invalid QR pairing password"));
+    }
+    Ok(password)
+}
+
+fn pair_with_secret(address: SocketAddr, pairing_code: &str, key_path: &Path) -> Result<String> {
     let key = load_or_create_key(key_path)?;
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
     stream.set_nodelay(true)?;
@@ -89,6 +116,37 @@ pub fn pair(address: SocketAddr, pairing_code: &str, key_path: &Path) -> Result<
     write_packet(&mut tls, 1, &cipher.encrypt(&peer_info)?)?;
     let device_info = cipher.decrypt(&read_packet(&mut tls, 1)?)?;
     parse_device_guid(&device_info)
+}
+
+#[cfg(test)]
+mod qr_password_tests {
+    use super::read_pairing_password;
+
+    #[test]
+    fn accepts_qr_secret_longer_than_six_digits() {
+        let secret = "a7f0c13d4209b865a7f0c13d4209b865";
+        assert_eq!(&*read_pairing_password(secret.as_bytes()).unwrap(), secret);
+    }
+
+    #[test]
+    fn rejects_empty_oversized_and_control_character_secrets() {
+        for secret in [
+            String::new(),
+            "a".repeat(65),
+            "secret\n".into(),
+            "abc\0def".into(),
+        ] {
+            assert!(read_pairing_password(secret.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_official_qr_example_password() {
+        assert_eq!(
+            &*read_pairing_password(b"(Aq+v9>Cx>!/".as_slice()).unwrap(),
+            "(Aq+v9>Cx>!/"
+        );
+    }
 }
 
 fn load_or_create_key(path: &Path) -> Result<ADBRsaKey> {

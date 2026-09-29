@@ -6,7 +6,7 @@ use crate::{
 use adb_client::{
     ADBDeviceExt, RebootType,
     mdns::MDNSDiscoveryService,
-    server::{ADBServer, DeviceLong},
+    server::{ADBServer, DeviceLong, DeviceState},
     server_device::ADBServerDevice,
     tcp::ADBTcpDevice,
     usb::{ADBDeviceInfo, find_all_connected_adb_devices},
@@ -79,7 +79,7 @@ fn usb_transport_id(device: &ADBDeviceInfo) -> u64 {
                 .clone()
                 .unwrap_or_else(|| format!("{:04x}:{:04x}", device.vendor_id, device.product_id))
         },
-        |location| format!("{location:016x}"),
+        |location| format!("{location:016x}#{:016x}", device.registry_id.unwrap_or(0)),
     );
     stable_transport_id("usb", &identity)
 }
@@ -90,35 +90,45 @@ fn usb_context(key: &Path, device: &ADBDeviceInfo) -> Context {
         vendor: device.vendor_id,
         product: device.product_id,
         location: device.location_id.unwrap_or(0),
+        registry_id: device.registry_id.unwrap_or(0),
     }
 }
 
 fn usb_selector(device: &ADBDeviceInfo) -> String {
     format!(
-        "usb-{:04x}:{:04x}@{:016x}",
+        "usb-{:04x}:{:04x}@{:016x}#{:016x}",
         device.vendor_id,
         device.product_id,
-        device.location_id.unwrap_or(0)
+        device.location_id.unwrap_or(0),
+        device.registry_id.unwrap_or(0)
     )
 }
 
-fn parse_usb_selector(value: &str) -> Option<(u16, u16, u64)> {
+fn parse_usb_selector(value: &str) -> Option<(u16, u16, u64, u64)> {
     let (ids, location) = value.strip_prefix("usb-")?.split_once('@')?;
+    let (location, registry_id) = location.split_once('#')?;
     let (vendor, product) = ids.split_once(':')?;
     let location = u64::from_str_radix(location, 16).ok()?;
-    (location != 0).then_some((
+    let registry_id = u64::from_str_radix(registry_id, 16).ok()?;
+    (location != 0 && registry_id != 0).then_some((
         u16::from_str_radix(vendor, 16).ok()?,
         u16::from_str_radix(product, 16).ok()?,
         location,
+        registry_id,
     ))
 }
 
 fn server_selector(device: &DeviceLong) -> String {
-    format!("androconnect-server-{}:{}", device.transport_id, device.identifier)
+    format!(
+        "androconnect-server-{}:{}",
+        device.transport_id, device.identifier
+    )
 }
 
 fn parse_server_selector(value: &str) -> Option<(u64, &str)> {
-    let (id, serial) = value.strip_prefix("androconnect-server-")?.split_once(':')?;
+    let (id, serial) = value
+        .strip_prefix("androconnect-server-")?
+        .split_once(':')?;
     (!serial.is_empty()).then_some((id.parse().ok()?, serial))
 }
 
@@ -132,11 +142,12 @@ fn usb_listing(device: &ADBDeviceInfo, details: Result<String, String>) -> Strin
             .unwrap_or_else(|| usb_selector(device))
     };
     let metadata = format!(
-        "transport_id:{} androconnect_usb:{:04x}:{:04x}@{:016x}",
+        "transport_id:{} androconnect_usb:{:04x}:{:04x}@{:016x}#{:016x}",
         usb_transport_id(device),
         device.vendor_id,
         device.product_id,
-        device.location_id.unwrap_or(0)
+        device.location_id.unwrap_or(0),
+        device.registry_id.unwrap_or(0)
     );
     match details {
         Ok(details) => {
@@ -647,6 +658,44 @@ fn existing_server_devices()
     }
 }
 
+fn connect_via_existing_server(address: SocketAddr) -> bool {
+    let Ok(Some((server_address, devices))) = existing_server_devices() else {
+        return false;
+    };
+    let identifier = address.to_string();
+    if devices
+        .iter()
+        .any(|device| device.identifier == identifier && device.state == DeviceState::Device)
+    {
+        return true;
+    }
+    let SocketAddr::V4(device_address) = address else {
+        return false;
+    };
+    let mut server = ADBServer::new_existing(server_address);
+    if server.connect_device(device_address).is_err() {
+        return false;
+    }
+    for attempt in 0..3 {
+        if let Ok(devices) = server.devices_long() {
+            if devices.iter().any(|device| {
+                device.identifier == identifier && device.state == DeviceState::Device
+            }) {
+                return true;
+            }
+            if devices.iter().any(|device| {
+                device.identifier == identifier && device.state == DeviceState::Unauthorized
+            }) {
+                return false;
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    false
+}
+
 fn server_device(
     address: SocketAddrV4,
     serial: Option<&str>,
@@ -1042,8 +1091,10 @@ fn create_pull_temporary(local: &Path) -> Result<(PathBuf, fs::File), Box<dyn st
     loop {
         let mut bytes = [0u8; 16];
         random.read_exact(&mut bytes)?;
-        let path =
-            local.with_file_name(format!(".androconnect-{:032x}.partial", u128::from_ne_bytes(bytes)));
+        let path = local.with_file_name(format!(
+            ".androconnect-{:032x}.partial",
+            u128::from_ne_bytes(bytes)
+        ));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1158,11 +1209,12 @@ fn run_wireless_device_command(
         Some("shell") | Some("exec-out") => {
             let command = args[1..].join(" ");
             if args[0] == "shell" {
-                device.shell_command(
-                    &command,
-                    Some(&mut std::io::stdout()),
-                    Some(&mut std::io::stderr()),
-                )?;
+                // The legacy session discards the remote exit status, which made
+                // every failed command look successful. The dispatched device
+                // uses shell v2 and returns an error for a non-zero exit.
+                device
+                    .into_dispatched()
+                    .shell_command(&command, Some(&mut std::io::stdout()))?;
             } else {
                 device.exec(&command, &mut std::io::empty(), Box::new(std::io::stdout()))?;
             }
@@ -1458,11 +1510,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let mut vendor = None;
         let mut product = None;
         let mut location = None;
+        let mut registry_id = None;
         while args.first().is_some_and(|arg| arg.starts_with("--")) && args.len() >= 2 {
             match args[0].as_str() {
                 "--vendor-id" => vendor = Some(u16::from_str_radix(&args[1], 16)?),
                 "--product-id" => product = Some(u16::from_str_radix(&args[1], 16)?),
                 "--location-id" => location = Some(u64::from_str_radix(&args[1], 16)?),
+                "--registry-id" => registry_id = Some(u64::from_str_radix(&args[1], 16)?),
                 "--private-key" => {} // App supplies the same key in the environment.
                 _ => return Err("unsupported USB option".into()),
             }
@@ -1472,14 +1526,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             vendor.ok_or("missing vendor")?,
             product.ok_or("missing product")?,
             location,
+            registry_id,
         ));
     }
     let mut named_server_transport = false;
     if let Some(value) = serial.clone() {
         if value.starts_with("usb-") && value.contains('@') {
-            let (vendor, product, location) =
+            let (vendor, product, location, registry_id) =
                 parse_usb_selector(&value).ok_or("invalid USB transport selector")?;
-            endpoint = Some((vendor, product, Some(location)));
+            endpoint = Some((vendor, product, Some(location), Some(registry_id)));
             serial = None;
         } else if value.starts_with("androconnect-server-") {
             let (id, expected_serial) =
@@ -1492,12 +1547,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("pair") if args.len() == 3 => {
             let address: SocketAddr = args[1].parse()?;
-            let guid = wireless::pair(address, &args[2], &key)?;
+            let guid = if args[2] == "--password-stdin" {
+                wireless::pair_with_password_from_reader(address, std::io::stdin().lock(), &key)?
+            } else {
+                wireless::pair(address, &args[2], &key)?
+            };
             println!("Successfully paired to {address} [{guid}]");
             return Ok(());
         }
         Some("connect") if args.len() == 2 => {
             let address: SocketAddr = args[1].parse()?;
+            if connect_via_existing_server(address) {
+                println!("connected to {address} through existing server");
+                return Ok(());
+            }
             let serial = connect_wireless(address, &key)?;
             update_wireless_endpoints(&key, |endpoints| {
                 endpoints.insert(address);
@@ -1507,7 +1570,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("disconnect") if args.len() <= 2 => {
             if let Some(value) = args.get(1).filter(|value| value.as_str() != "-a") {
-                let address = value.parse()?;
+                let address: SocketAddr = value.parse()?;
+                if let SocketAddr::V4(device_address) = address
+                    && let Ok(Some((server_address, devices))) = existing_server_devices()
+                    && devices
+                        .iter()
+                        .any(|device| device.identifier == value.as_str())
+                {
+                    ADBServer::new_existing(server_address).disconnect_device(device_address)?;
+                }
                 update_wireless_endpoints(&key, |endpoints| {
                     endpoints.remove(&address);
                 })?;
@@ -1548,7 +1619,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
-        Some("pair") => return Err("usage: adb pair HOST:PORT PAIRING_CODE".into()),
+        Some("pair") => {
+            return Err("usage: adb pair HOST:PORT PAIRING_CODE|--password-stdin".into());
+        }
         Some("connect") => return Err("usage: adb connect HOST:PORT".into()),
         Some("disconnect") => return Err("usage: adb disconnect [HOST:PORT|-a]".into()),
         Some("mdns") => return Err("usage: adb mdns check|services".into()),
@@ -1755,10 +1828,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let matches: Vec<_> = devices
         .iter()
         .filter(|device| {
-            endpoint.is_none_or(|(v, p, location)| {
+            endpoint.is_none_or(|(v, p, location, registry_id)| {
                 device.vendor_id == v
                     && device.product_id == p
                     && location.is_none_or(|value| device.location_id == Some(value))
+                    && registry_id.is_none_or(|value| device.registry_id == Some(value))
             })
         })
         .filter(|device| {
@@ -2167,6 +2241,7 @@ mod tests {
             vendor_id: 0x18d1,
             product_id: 0x4ee7,
             location_id: Some(0x01100000),
+            registry_id: Some(101),
             serial: Some("SAME".into()),
             device_description: String::new(),
         };
@@ -2179,15 +2254,36 @@ mod tests {
         assert_ne!(a.split_whitespace().next(), b.split_whitespace().next());
         assert_eq!(
             parse_usb_selector(a.split_whitespace().next().unwrap()),
-            Some((0x18d1, 0x4ee7, 0x01100000))
+            Some((0x18d1, 0x4ee7, 0x01100000, 101))
         );
         assert_eq!(
             parse_usb_selector(b.split_whitespace().next().unwrap()),
-            Some((0x18d1, 0x4ee7, 0x01200000))
+            Some((0x18d1, 0x4ee7, 0x01200000, 101))
         );
         assert!(parse_usb_selector("usb-18d1:4ee7@0").is_none());
         assert!(usb_listing(&first, Err("unauthorized".into())).contains("\tunauthorized "));
         assert!(usb_listing(&second, Err("0xe00002c5".into())).contains("\tusb_busy "));
+
+        // Same model, port and reported serial, but a different attachment.
+        let replacement = adb_client::usb::ADBDeviceInfo {
+            registry_id: Some(102),
+            ..first.clone()
+        };
+        assert_ne!(
+            super::usb_selector(&first),
+            super::usb_selector(&replacement)
+        );
+        assert_ne!(
+            super::usb_transport_id(&first),
+            super::usb_transport_id(&replacement)
+        );
+        let key = std::path::PathBuf::from("/tmp/attachment-check-key");
+        assert_ne!(
+            crate::direct_daemon::socket_path(&super::usb_context(&key, &first)).unwrap(),
+            crate::direct_daemon::socket_path(&super::usb_context(&key, &replacement)).unwrap()
+        );
+        assert!(parse_usb_selector("usb-18d1:4ee7@0000000001100000").is_none());
+        assert!(parse_usb_selector("usb-18d1:4ee7@0000000001100000#0").is_none());
     }
 
     #[test]

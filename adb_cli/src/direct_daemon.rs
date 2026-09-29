@@ -30,6 +30,7 @@ pub(crate) struct Context {
     pub vendor: u16,
     pub product: u16,
     pub location: u64,
+    pub registry_id: u64,
 }
 
 const MAX_CONCURRENT_REQUESTS: usize = 12;
@@ -56,11 +57,12 @@ pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::err
     // identity into one filename directly below TMPDIR so the location ID does
     // not make the socket path exceed SUN_LEN.
     let identity = format!(
-        "{}\0{:04x}:{:04x}:{:016x}",
+        "{}\0{:04x}:{:04x}:{:016x}:{:016x}",
         context.key.display(),
         context.vendor,
         context.product,
-        context.location
+        context.location,
+        context.registry_id
     );
     let hash = identity
         .as_bytes()
@@ -68,7 +70,7 @@ pub(crate) fn socket_path(context: &Context) -> Result<PathBuf, Box<dyn std::err
         .fold(0xcbf2_9ce4_8422_2325u64, |value, byte| {
             (value ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-    Ok(std::env::temp_dir().join(format!("mab3-{hash:016x}.sock")))
+    Ok(std::env::temp_dir().join(format!("mab4-{hash:016x}.sock")))
 }
 
 fn daemon_is_healthy(socket: &std::path::Path) -> bool {
@@ -106,6 +108,7 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         .env("ADB_CLI_VENDOR", context.vendor.to_string())
         .env("ADB_CLI_PRODUCT", context.product.to_string())
         .env("ADB_CLI_LOCATION", context.location.to_string())
+        .env("ADB_CLI_REGISTRY_ID", context.registry_id.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(
@@ -316,16 +319,18 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         vendor: std::env::var("ADB_CLI_VENDOR")?.parse()?,
         product: std::env::var("ADB_CLI_PRODUCT")?.parse()?,
         location: std::env::var("ADB_CLI_LOCATION")?.parse()?,
+        registry_id: std::env::var("ADB_CLI_REGISTRY_ID")?.parse()?,
     };
     let socket = socket_path(&context)?;
     if socket.exists() {
         fs::remove_file(&socket)?;
     }
     let device = Arc::new(
-        ADBUSBDevice::new_with_custom_private_key_at_location(
+        ADBUSBDevice::new_with_custom_private_key_at_attachment(
             context.vendor,
             context.product,
             context.location,
+            context.registry_id,
             context.key,
         )
         .map_err(|error| format!("USB connect/authenticate failed: {error}"))?
@@ -388,6 +393,17 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Fields are tab-separated, so a path containing a tab would otherwise be
+/// silently truncated and the operation applied to a different path.
+fn reject_extra_fields<'a>(
+    mut fields: impl Iterator<Item = &'a str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if fields.next().is_some() {
+        return Err("invalid request: unexpected extra fields (paths must not contain tabs)".into());
+    }
+    Ok(())
+}
+
 fn handle(
     device: Arc<ADBDispatchedUSBDevice>,
     shutdown_requested: Arc<AtomicBool>,
@@ -423,6 +439,7 @@ fn handle(
             let source = fields.next().ok_or("missing APK")?;
             let flags = fields.next().unwrap_or("");
             let user = fields.next().unwrap_or("");
+            reject_extra_fields(&mut fields)?;
             if !flags
                 .split_whitespace()
                 .all(|flag| matches!(flag, "-r" | "-g" | "-d"))
@@ -465,6 +482,7 @@ fn handle(
             let keep = fields.next().ok_or("missing uninstall option")?;
             let user = fields.next().ok_or("missing uninstall user")?;
             let package = fields.next().ok_or("missing package")?;
+            reject_extra_fields(&mut fields)?;
             if (keep != "" && keep != "-k")
                 || package.is_empty()
                 || !package
@@ -500,20 +518,24 @@ fn handle(
         "PUSH" => {
             let source = fields.next().ok_or("missing push source")?;
             let destination = fields.next().ok_or("missing push destination")?;
+            reject_extra_fields(&mut fields)?;
             let mut input = fs::File::open(source)?;
             device.push(&mut input, destination)?;
         }
         "PUSH_STREAM" => {
             let destination = fields.next().ok_or("missing push destination")?;
+            reject_extra_fields(&mut fields)?;
             return input_stream_operation(stream, |input| device.push(input, destination));
         }
         "REVERSE" => {
             let remote = fields.next().ok_or("missing reverse remote")?;
             let local = fields.next().ok_or("missing reverse local")?;
+            reject_extra_fields(&mut fields)?;
             device.reverse_forward(remote.to_owned(), local.to_owned())?;
         }
         "REVERSE_REMOVE" => {
             let remote = fields.next().ok_or("missing reverse remote")?;
+            reject_extra_fields(&mut fields)?;
             device.remove_reverse_forward(remote.to_owned())?;
         }
         "REVERSE_LIST" => {
@@ -533,6 +555,7 @@ fn handle(
                 .next()
                 .ok_or("missing remote forward endpoint")?
                 .to_owned();
+            reject_extra_fields(&mut fields)?;
             let device = Arc::clone(&device);
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let listener_device = Arc::clone(&device);
@@ -552,6 +575,7 @@ fn handle(
         }
         "FORWARD_REMOVE" => {
             let local = fields.next().ok_or("missing local forward endpoint")?;
+            reject_extra_fields(&mut fields)?;
             if !device.remove_forward(local) {
                 return Err("forward rule not found".into());
             }
@@ -567,6 +591,7 @@ fn handle(
         }
         "TCPIP" => {
             let port = fields.next().ok_or("missing TCP port")?.parse::<u16>()?;
+            reject_extra_fields(&mut fields)?;
             if port == 0 {
                 return Err("TCP port must be between 1 and 65535".into());
             }
@@ -590,6 +615,18 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_in_path_is_rejected_instead_of_truncated() {
+        let mut fields = "PUSH_STREAM\t/sdcard/a\tb".split('\t');
+        fields.next();
+        fields.next();
+        assert!(reject_extra_fields(&mut fields).is_err());
+        let mut fields = "PUSH_STREAM\t/sdcard/a".split('\t');
+        fields.next();
+        fields.next();
+        assert!(reject_extra_fields(&mut fields).is_ok());
+    }
 
     #[test]
     fn explicit_shutdown_stops_daemon_while_device_is_alive() {

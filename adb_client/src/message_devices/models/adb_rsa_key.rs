@@ -38,14 +38,23 @@ impl ADBRsaInternalPublicKey {
         })
     }
 
-    pub fn into_bytes(mut self) -> Vec<u8> {
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.append(&mut self.modulus_size_words.to_le_bytes().to_vec());
-        bytes.append(&mut self.n0inv.to_le_bytes().to_vec());
-        bytes.append(&mut self.modulus.to_bytes_le());
-        bytes.append(&mut self.rr);
-        bytes.append(&mut self.exponent.to_le_bytes().to_vec());
-
+    pub fn into_bytes(self) -> Vec<u8> {
+        // Android's RSAPublicKey stores both integers in fixed-width arrays.
+        // BigUint drops high zero bytes in little-endian form; in particular,
+        // RR may be 255 bytes. Without padding the exponent shifts by a byte,
+        // pairing appears successful, but adbd cannot authorize the TLS key.
+        let integer_size = self.modulus_size_words as usize * 4;
+        let mut modulus = self.modulus.to_bytes_le();
+        let mut rr = self.rr;
+        assert!(modulus.len() <= integer_size && rr.len() <= integer_size);
+        modulus.resize(integer_size, 0);
+        rr.resize(integer_size, 0);
+        let mut bytes = Vec::with_capacity(12 + integer_size * 2);
+        bytes.extend_from_slice(&self.modulus_size_words.to_le_bytes());
+        bytes.extend_from_slice(&self.n0inv.to_le_bytes());
+        bytes.extend_from_slice(&modulus);
+        bytes.extend_from_slice(&rr);
+        bytes.extend_from_slice(&self.exponent.to_le_bytes());
         bytes
     }
 }
@@ -231,7 +240,8 @@ fn set_bit(n: usize) -> Result<BigUint> {
 #[cfg(test)]
 mod tests {
     use super::{
-        KEY_TEMPORARY_SEQUENCE, load_or_create_adb_private_key, read_adb_private_key, set_bit,
+        ADBRsaInternalPublicKey, KEY_TEMPORARY_SEQUENCE, load_or_create_adb_private_key,
+        read_adb_private_key, set_bit,
     };
     use crate::message_devices::models::ADBRsaKey;
     use rsa::BigUint;
@@ -289,6 +299,25 @@ ile69MHFENUePSpuRSiF3Z02
     Awu6BlgK37TUn0JdK0Z6Z4RaEIaNiEI0d5CoP6zQKV2QQnlscYpdsaUW5t9/F\
     LioVXPwrz0tx35JyIUZPPYwEAAQA= ";
         assert_eq!(&pub_key[..pub_key_adb.len()], pub_key_adb);
+    }
+
+    #[test]
+    fn android_pubkey_preserves_fixed_width_when_rr_has_leading_zero() {
+        let encoded = ADBRsaInternalPublicKey {
+            modulus_size_words: 64,
+            n0inv: 7,
+            modulus: BigUint::from(17_u32),
+            rr: vec![0x5a; 255],
+            exponent: 65537,
+        }
+        .into_bytes();
+        assert_eq!(encoded.len(), 524);
+        assert_eq!(&encoded[..4], &64_u32.to_le_bytes());
+        assert_eq!(encoded[8], 17);
+        assert!(encoded[9..264].iter().all(|byte| *byte == 0));
+        assert!(encoded[264..519].iter().all(|byte| *byte == 0x5a));
+        assert_eq!(encoded[519], 0);
+        assert_eq!(&encoded[520..], &65537_u32.to_le_bytes());
     }
 
     #[test]

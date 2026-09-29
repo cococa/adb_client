@@ -10,6 +10,7 @@ struct MacADBDeviceInfo {
     vendor_id: u16,
     product_id: u16,
     location_id: u64,
+    registry_id: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -29,6 +30,8 @@ pub struct ADBDeviceInfo {
     pub product_id: u16,
     /// Stable physical USB location identity when supplied by the platform.
     pub location_id: Option<u64>,
+    /// Identity of this attachment, replaced when the USB interface is re-enumerated.
+    pub registry_id: Option<u64>,
     /// Human-readable manufacturer and product description when available.
     pub device_description: String,
 }
@@ -55,6 +58,7 @@ pub fn find_all_connected_adb_devices() -> Result<Vec<ADBDeviceInfo>> {
                     vendor_id: device.vendor_id,
                     product_id: device.product_id,
                     location_id: (device.location_id != 0).then_some(device.location_id),
+                    registry_id: (device.registry_id != 0).then_some(device.registry_id),
                     serial: None,
                     device_description: String::new(),
                 })
@@ -78,6 +82,7 @@ pub fn find_all_connected_adb_devices() -> Result<Vec<ADBDeviceInfo>> {
             serial: device.serial_number().map(str::to_owned),
             product_id: device.product_id(),
             location_id: None,
+            registry_id: None,
             device_description: [device.manufacturer_string(), device.product_string()]
                 .into_iter()
                 .flatten()

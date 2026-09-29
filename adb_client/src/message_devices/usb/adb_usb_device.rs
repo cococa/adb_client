@@ -58,6 +58,20 @@ impl ADBUSBDevice {
         )
     }
 
+    /// Instantiate a device pinned to one macOS USB interface attachment.
+    pub fn new_with_custom_private_key_at_attachment<P: AsRef<Path>>(
+        vendor_id: u16,
+        product_id: u16,
+        location_id: u64,
+        registry_id: u64,
+        private_key_path: P,
+    ) -> Result<Self> {
+        Self::new_from_transport_inner(
+            USBTransport::new_at_attachment(vendor_id, product_id, location_id, registry_id)?,
+            private_key_path,
+        )
+    }
+
     /// Instantiate a new [`ADBUSBDevice`] from a [`USBTransport`] and an optional private key path.
     pub fn new_from_transport(
         transport: USBTransport,
@@ -113,10 +127,11 @@ impl ADBUSBDevice {
     /// Returns an error if multiple devices are connected or if none can be detected.
     pub fn autodetect_with_custom_private_key(private_key_path: PathBuf) -> Result<Self> {
         match utils::get_single_connected_adb_device()? {
-            Some(device_info) => Self::new_with_custom_private_key_at_location(
+            Some(device_info) => Self::new_with_custom_private_key_at_attachment(
                 device_info.vendor_id,
                 device_info.product_id,
                 device_info.location_id.unwrap_or(0),
+                device_info.registry_id.unwrap_or(0),
                 private_key_path,
             ),
             _ => Err(RustADBError::DeviceNotFound(

@@ -33,6 +33,7 @@ mod macos_iokit {
             vendor_id: u16,
             product_id: u16,
             location_id: u64,
+            registry_id: u64,
             output: *mut *mut Handle,
         ) -> i32;
         pub fn macadb_read(
@@ -71,6 +72,7 @@ pub struct USBTransport {
     vendor_id: u16,
     product_id: u16,
     location_id: u64,
+    registry_id: u64,
     #[cfg(target_os = "macos")]
     connection: Option<Arc<Mutex<MacOSConnection>>>,
 }
@@ -81,6 +83,7 @@ impl Clone for USBTransport {
             vendor_id: self.vendor_id,
             product_id: self.product_id,
             location_id: self.location_id,
+            registry_id: self.registry_id,
             #[cfg(target_os = "macos")]
             connection: self.connection.clone(),
         }
@@ -92,6 +95,7 @@ impl std::fmt::Debug for USBTransport {
             .field("vendor_id", &format_args!("{:04x}", self.vendor_id))
             .field("product_id", &format_args!("{:04x}", self.product_id))
             .field("location_id", &format_args!("{:016x}", self.location_id))
+            .field("registry_id", &format_args!("{:016x}", self.registry_id))
             .field("connected", &self.is_connected())
             .finish()
     }
@@ -105,6 +109,16 @@ impl USBTransport {
 
     /// Creates a transport pinned to one physical macOS USB location.
     pub fn new_at_location(vendor_id: u16, product_id: u16, location_id: u64) -> Result<Self> {
+        Self::new_at_attachment(vendor_id, product_id, location_id, 0)
+    }
+
+    /// Pins the open itself to the discovered interface, closing the scan/open race.
+    pub fn new_at_attachment(
+        vendor_id: u16,
+        product_id: u16,
+        location_id: u64,
+        registry_id: u64,
+    ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             // Discovery and open both use the native IOKit interface API.
@@ -114,6 +128,7 @@ impl USBTransport {
                 vendor_id,
                 product_id,
                 location_id,
+                registry_id,
                 connection: None,
             });
         }
@@ -140,6 +155,7 @@ impl USBTransport {
             vendor_id: device_info.vendor_id(),
             product_id: device_info.product_id(),
             location_id: 0,
+            registry_id: 0,
             #[cfg(target_os = "macos")]
             connection: None,
         })
@@ -257,6 +273,7 @@ impl ADBTransport for USBTransport {
                     self.vendor_id,
                     self.product_id,
                     self.location_id,
+                    self.registry_id,
                     &mut handle,
                 )
             };
