@@ -9,6 +9,9 @@
 mod error;
 pub mod auth;
 pub mod message;
+pub mod session;
 
 pub use error::ProtoError;
+pub use auth::AdbKey;
 pub use message::{Command, Packet, PacketDecoder};
+pub use session::{DeviceBanner, Event, Session, SessionConfig};
