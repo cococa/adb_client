@@ -40,24 +40,45 @@ pub fn recv_request(path: &str) -> Vec<u8> {
     frame(b"RECV", len_u32(path.len()), path.as_bytes())
 }
 
+/// `stat()` with 64-bit size and time; needs the device feature `stat_v2`.
+pub fn stat2_request(path: &str) -> Vec<u8> {
+    frame(b"STA2", len_u32(path.len()), path.as_bytes())
+}
+
+/// Directory listing with 64-bit size and time; needs the device feature `ls_v2`.
+pub fn list2_request(path: &str) -> Vec<u8> {
+    frame(b"LIS2", len_u32(path.len()), path.as_bytes())
+}
+
+/// Device features (from the CNXN banner) that enable the v2 requests.
+pub const FEATURE_STAT_V2: &str = "stat_v2";
+pub const FEATURE_LS_V2: &str = "ls_v2";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncKind {
     Stat,
     List,
     Recv,
+    Stat2,
+    List2,
 }
 
+/// v1 replies carry 32-bit sizes and times, v2 replies 64-bit ones; both are
+/// widened to the same event. `error` is the device errno (always 0 in v1,
+/// which omits entries it cannot stat).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
     Stat {
         mode: u32,
-        size: u32,
-        mtime: u32,
+        size: u64,
+        mtime: i64,
+        error: u32,
     },
     Dent {
         mode: u32,
-        size: u32,
-        mtime: u32,
+        size: u64,
+        mtime: i64,
+        error: u32,
         name: String,
     },
     Data(Vec<u8>),
@@ -65,7 +86,7 @@ pub enum SyncEvent {
     Fail(String),
 }
 
-/// Incremental parser for AOSP's v1 STAT/LIST/RECV replies. Feed arbitrary
+/// Incremental parser for AOSP's STAT/LIST/RECV and STA2/LIS2 replies. Feed arbitrary
 /// transport fragments with `push`, then drain available events.
 pub struct SyncReader {
     kind: SyncKind,
@@ -99,10 +120,16 @@ impl SyncReader {
             }
             let event = SyncEvent::Stat {
                 mode: word(&self.bytes[4..8]),
-                size: word(&self.bytes[8..12]),
-                mtime: word(&self.bytes[12..16]),
+                size: u64::from(word(&self.bytes[8..12])),
+                mtime: i64::from(word(&self.bytes[12..16])),
+                error: 0,
             };
             (16, event, true)
+        } else if id == b"STA2" && self.kind == SyncKind::Stat2 {
+            if self.bytes.len() < STAT_V2_LEN {
+                return Ok(None);
+            }
+            (STAT_V2_LEN, stat_v2(&self.bytes, None), true)
         } else if id == b"DENT" && self.kind == SyncKind::List {
             if self.bytes.len() < 20 {
                 return Ok(None);
@@ -116,11 +143,30 @@ impl SyncReader {
             }
             let event = SyncEvent::Dent {
                 mode: word(&self.bytes[4..8]),
-                size: word(&self.bytes[8..12]),
-                mtime: word(&self.bytes[12..16]),
+                size: u64::from(word(&self.bytes[8..12])),
+                mtime: i64::from(word(&self.bytes[12..16])),
+                error: 0,
                 name: String::from_utf8_lossy(&self.bytes[20..20 + name_len]).into_owned(),
             };
             (20 + name_len, event, false)
+        } else if id == b"DNT2" && self.kind == SyncKind::List2 {
+            if self.bytes.len() < DENT_V2_LEN {
+                return Ok(None);
+            }
+            let name_len = word(&self.bytes[STAT_V2_LEN..DENT_V2_LEN]) as usize;
+            if name_len > 1024 {
+                return Err(protocol("directory entry name exceeds 1024 bytes"));
+            }
+            if self.bytes.len() < DENT_V2_LEN + name_len {
+                return Ok(None);
+            }
+            let name = String::from_utf8_lossy(&self.bytes[DENT_V2_LEN..DENT_V2_LEN + name_len])
+                .into_owned();
+            (
+                DENT_V2_LEN + name_len,
+                stat_v2(&self.bytes, Some(name)),
+                false,
+            )
         } else if id == b"DATA" && self.kind == SyncKind::Recv {
             if self.bytes.len() < 8 {
                 return Ok(None);
@@ -137,8 +183,13 @@ impl SyncReader {
                 SyncEvent::Data(self.bytes[8..8 + size].to_vec()),
                 false,
             )
-        } else if id == b"DONE" && self.kind != SyncKind::Stat {
-            let len = if self.kind == SyncKind::List { 20 } else { 8 };
+        } else if id == b"DONE" && !matches!(self.kind, SyncKind::Stat | SyncKind::Stat2) {
+            // LIST/LIS2 end with a whole zeroed dirent carrying ID_DONE.
+            let len = match self.kind {
+                SyncKind::List => 20,
+                SyncKind::List2 => DENT_V2_LEN,
+                _ => 8,
+            };
             if self.bytes.len() < len {
                 return Ok(None);
             }
@@ -167,6 +218,35 @@ impl SyncReader {
             self.complete = true;
         }
         Ok(Some(event))
+    }
+}
+
+/// AOSP `sync_stat_v2`: id, error u32, dev u64, ino u64, mode/nlink/uid/gid
+/// u32, size u64, atime/mtime/ctime i64.
+const STAT_V2_LEN: usize = 72;
+/// AOSP `sync_dent_v2`: the same fields plus namelen u32, then the name.
+const DENT_V2_LEN: usize = STAT_V2_LEN + 4;
+
+/// Builds a Stat (or, with a name, a Dent) event from a v2 reply's fixed part.
+fn stat_v2(bytes: &[u8], name: Option<String>) -> SyncEvent {
+    let error = word(&bytes[4..8]);
+    let mode = word(&bytes[24..28]);
+    let size = u64::from_le_bytes(bytes[40..48].try_into().expect("eight bytes"));
+    let mtime = i64::from_le_bytes(bytes[56..64].try_into().expect("eight bytes"));
+    match name {
+        Some(name) => SyncEvent::Dent {
+            mode,
+            size,
+            mtime,
+            error,
+            name,
+        },
+        None => SyncEvent::Stat {
+            mode,
+            size,
+            mtime,
+            error,
+        },
     }
 }
 
@@ -287,7 +367,8 @@ mod tests {
             Some(SyncEvent::Stat {
                 mode: 0o100644,
                 size: 3,
-                mtime: 4
+                mtime: 4,
+                error: 0,
             })
         );
 
@@ -309,12 +390,14 @@ mod tests {
                     mode: 0o40755,
                     size: 0,
                     mtime: 4,
+                    error: 0,
                     name: "dir".into()
                 },
                 SyncEvent::Dent {
                     mode: 0o100644,
                     size: 5,
                     mtime: 6,
+                    error: 0,
                     name: "x".into()
                 },
                 SyncEvent::Done,
@@ -354,6 +437,116 @@ mod tests {
         assert!(reader.next_event().is_err());
         let mut reader = SyncReader::new(SyncKind::List);
         reader.push(b"DATA\0\0\0\0");
+        assert!(reader.next_event().is_err());
+    }
+
+    /// AOSP sync_stat_v2 body after the id: error u32, dev u64, ino u64,
+    /// mode/nlink/uid/gid u32, size u64, atime/mtime/ctime i64 (68 bytes).
+    fn stat_v2_body(error: u32, mode: u32, size: u64, mtime: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(error.to_le_bytes());
+        out.extend(1u64.to_le_bytes()); // dev
+        out.extend(2u64.to_le_bytes()); // ino
+        out.extend(mode.to_le_bytes());
+        out.extend(1u32.to_le_bytes()); // nlink
+        out.extend(1000u32.to_le_bytes()); // uid
+        out.extend(1000u32.to_le_bytes()); // gid
+        out.extend(size.to_le_bytes());
+        out.extend(7i64.to_le_bytes()); // atime
+        out.extend(mtime.to_le_bytes());
+        out.extend(9i64.to_le_bytes()); // ctime
+        out
+    }
+
+    fn dent_v2(error: u32, mode: u32, size: u64, mtime: i64, name: &str) -> Vec<u8> {
+        let mut out = b"DNT2".to_vec();
+        out.extend(stat_v2_body(error, mode, size, mtime));
+        out.extend((name.len() as u32).to_le_bytes());
+        out.extend(name.as_bytes());
+        out
+    }
+
+    #[test]
+    fn v2_request_layouts_follow_aosp_sync_request() {
+        assert_eq!(stat2_request("/a"), b"STA2\x02\0\0\0/a");
+        assert_eq!(list2_request("/sdcard"), b"LIS2\x07\0\0\0/sdcard");
+    }
+
+    #[test]
+    fn reads_stat_v2_with_sizes_beyond_4_gib() {
+        let mut reply = b"STA2".to_vec();
+        reply.extend(stat_v2_body(0, 0o100644, 5_000_000_000, 1_800_000_000));
+        assert_eq!(reply.len(), 72);
+        let mut reader = SyncReader::new(SyncKind::Stat2);
+        for byte in &reply[..71] {
+            reader.push(&[*byte]);
+            assert_eq!(reader.next_event().unwrap(), None);
+        }
+        reader.push(&reply[71..]);
+        assert_eq!(
+            reader.next_event().unwrap(),
+            Some(SyncEvent::Stat {
+                mode: 0o100644,
+                size: 5_000_000_000,
+                mtime: 1_800_000_000,
+                error: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn reports_stat_v2_errors() {
+        let mut reply = b"STA2".to_vec();
+        reply.extend(stat_v2_body(2, 0, 0, 0)); // ENOENT
+        let mut reader = SyncReader::new(SyncKind::Stat2);
+        reader.push(&reply);
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            Some(SyncEvent::Stat { error: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn reads_v2_listing_including_failed_entries_and_long_done() {
+        let mut reply = dent_v2(0, 0o100644, 6_442_450_944, 11, "movie.mkv");
+        reply.extend(dent_v2(13, 0, 0, 0, "locked")); // EACCES from lstat
+        // do_list<true> ends with a zeroed sync_dent_v2 carrying ID_DONE.
+        reply.extend(b"DONE");
+        reply.extend([0u8; 72]);
+        let mut reader = SyncReader::new(SyncKind::List2);
+        let mut events = Vec::new();
+        for chunk in reply.chunks(13) {
+            reader.push(chunk);
+            while let Some(event) = reader.next_event().unwrap() {
+                events.push(event);
+            }
+        }
+        assert_eq!(
+            events,
+            vec![
+                SyncEvent::Dent {
+                    mode: 0o100644,
+                    size: 6_442_450_944,
+                    mtime: 11,
+                    error: 0,
+                    name: "movie.mkv".into()
+                },
+                SyncEvent::Dent {
+                    mode: 0,
+                    size: 0,
+                    mtime: 0,
+                    error: 13,
+                    name: "locked".into()
+                },
+                SyncEvent::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn v1_ids_are_rejected_by_v2_readers() {
+        let mut reader = SyncReader::new(SyncKind::List2);
+        reader.push(b"DENT\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
         assert!(reader.next_event().is_err());
     }
 }
