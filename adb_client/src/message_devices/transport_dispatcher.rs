@@ -352,9 +352,18 @@ fn run_loop<T: ADBMessageTransport>(
                     }
                 }
             },
-            Err(RustADBError::IOError(error)) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            // macOS reports a socket receive timeout as EAGAIN (WouldBlock)
+            // while other platforms commonly use TimedOut; both just mean no
+            // packet arrived during this poll.
+            Err(RustADBError::IOError(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => {
-                log::debug!("ADB dispatcher stopped after transport error: {error}");
+                eprintln!("[adb_client] ADB dispatcher stopped after transport error: {error}");
                 // Wake every in-flight operation so callers fail immediately
                 // instead of waiting for a USB timeout after unplug/replug.
                 for (local_id, session_tx) in sessions.drain() {
