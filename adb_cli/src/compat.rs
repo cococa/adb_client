@@ -118,18 +118,53 @@ fn parse_usb_selector(value: &str) -> Option<(u16, u16, u64, u64)> {
     ))
 }
 
-fn server_selector(device: &DeviceLong) -> String {
-    format!(
-        "androconnect-server-{}:{}",
-        device.transport_id, device.identifier
-    )
+/// App-facing name of a device routed through an existing ADB server.
+/// Server transport IDs restart from 1 whenever that server restarts, so they
+/// are resolved per command instead of being part of the name. The USB path is
+/// added only when phones report the same serial.
+fn server_selector(device: &DeviceLong, devices: &[DeviceLong]) -> String {
+    let duplicate_serial = devices
+        .iter()
+        .filter(|other| other.identifier == device.identifier)
+        .count()
+        > 1;
+    match server_usb_path(device) {
+        Some(usb) if duplicate_serial => {
+            format!("androconnect-server:{}#usb:{usb}", device.identifier)
+        }
+        _ => format!("androconnect-server:{}", device.identifier),
+    }
 }
 
-fn parse_server_selector(value: &str) -> Option<(u64, &str)> {
-    let (id, serial) = value
-        .strip_prefix("androconnect-server-")?
-        .split_once(':')?;
-    (!serial.is_empty()).then_some((id.parse().ok()?, serial))
+fn server_usb_path(device: &DeviceLong) -> Option<&str> {
+    let usb = device.usb.as_str();
+    (!usb.is_empty() && usb != "Unk" && !usb.contains(':')).then_some(usb)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ServerSelector<'a> {
+    serial: &'a str,
+    usb: Option<&'a str>,
+}
+
+fn parse_server_selector(value: &str) -> Option<ServerSelector<'_>> {
+    let rest = value.strip_prefix("androconnect-server")?;
+    let rest = match rest.strip_prefix(':') {
+        Some(rest) => rest,
+        None => {
+            // Legacy `androconnect-server-N:SERIAL` names: N is stale after a
+            // server restart, so only the serial still identifies the phone.
+            let (id, serial) = rest.strip_prefix('-')?.split_once(':')?;
+            id.parse::<u64>().ok()?;
+            return (!serial.is_empty()).then_some(ServerSelector { serial, usb: None });
+        }
+    };
+    let (serial, usb) = match rest.rsplit_once("#usb:") {
+        Some((_, "")) => return None,
+        Some((serial, usb)) => (serial, Some(usb)),
+        None => (rest, None),
+    };
+    (!serial.is_empty()).then_some(ServerSelector { serial, usb })
 }
 
 fn usb_listing(device: &ADBDeviceInfo, details: Result<String, String>) -> String {
@@ -1530,17 +1565,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     let mut named_server_transport = false;
+    let mut server_usb: Option<String> = None;
     if let Some(value) = serial.clone() {
         if value.starts_with("usb-") && value.contains('@') {
             let (vendor, product, location, registry_id) =
                 parse_usb_selector(&value).ok_or("invalid USB transport selector")?;
             endpoint = Some((vendor, product, Some(location), Some(registry_id)));
             serial = None;
-        } else if value.starts_with("androconnect-server-") {
-            let (id, expected_serial) =
+        } else if value.starts_with("androconnect-server") {
+            let selector =
                 parse_server_selector(&value).ok_or("invalid server transport selector")?;
-            selected_transport_id = Some(id);
-            serial = Some(expected_serial.to_owned());
+            serial = Some(selector.serial.to_owned());
+            server_usb = selector.usb.map(str::to_owned);
             named_server_transport = true;
         }
     }
@@ -1651,7 +1687,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 identifiers.insert(device.identifier.clone());
                 println!(
                     "{}\t{} model:{} transport_id:{} androconnect_transport:server androconnect_serial:{}",
-                    server_selector(device),
+                    server_selector(device, server_devices),
                     device.state,
                     device.model,
                     device.transport_id,
@@ -1705,6 +1741,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .is_none_or(|serial| &device.identifier == serial)
                     && selected_transport_id.is_none_or(|id| u64::from(device.transport_id) == id)
+                    && server_usb
+                        .as_deref()
+                        .is_none_or(|usb| server_usb_path(device) == Some(usb))
             })
             .collect();
         let server_selected = if serial.is_some() || selected_transport_id.is_some() {
@@ -1713,12 +1752,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             server_devices.len() == 1
         };
         if server_selected {
-            return run_server_device_command(
-                *address,
-                serial.as_deref(),
-                selected_transport_id,
-                &args,
-            );
+            // Named server selectors route by the transport ID current now.
+            let transport_id = if named_server_transport {
+                matching_server_devices
+                    .first()
+                    .map(|device| u64::from(device.transport_id))
+            } else {
+                selected_transport_id
+            };
+            return run_server_device_command(*address, serial.as_deref(), transport_id, &args);
         }
         if !server_devices.is_empty()
             && serial.is_none()
@@ -1734,9 +1776,24 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if named_server_transport {
-        return Err(
-            "selected ADB server transport is no longer connected; refresh the device list".into(),
-        );
+        let ambiguous = server_usb.is_none()
+            && server.as_ref().is_some_and(|(_, devices)| {
+                devices
+                    .iter()
+                    .filter(|device| {
+                        serial
+                            .as_ref()
+                            .is_some_and(|serial| &device.identifier == serial)
+                    })
+                    .count()
+                    > 1
+            });
+        return Err(if ambiguous {
+            "several phones connected through the ADB server share this serial; refresh the device list"
+        } else {
+            "selected ADB server transport is no longer connected; refresh the device list"
+        }
+        .into());
     }
     if endpoint.is_none()
         && let Some(address) = serial
@@ -2287,22 +2344,72 @@ mod tests {
     }
 
     #[test]
-    fn server_selector_preserves_transport_and_expected_serial() {
-        use super::parse_server_selector;
+    fn server_selector_names_phones_without_transport_ids() {
+        use super::{ServerSelector, parse_server_selector};
+        assert_eq!(
+            parse_server_selector("androconnect-server:10ADAZ1PGM0034Y"),
+            Some(ServerSelector {
+                serial: "10ADAZ1PGM0034Y",
+                usb: None
+            })
+        );
+        assert_eq!(
+            parse_server_selector("androconnect-server:SAME#usb:336592896X"),
+            Some(ServerSelector {
+                serial: "SAME",
+                usb: Some("336592896X")
+            })
+        );
+        assert_eq!(
+            parse_server_selector("androconnect-server:[fe80::1]:5555"),
+            Some(ServerSelector {
+                serial: "[fe80::1]:5555",
+                usb: None
+            })
+        );
         assert_eq!(
             parse_server_selector("androconnect-server-7:SAME"),
-            Some((7, "SAME"))
+            Some(ServerSelector {
+                serial: "SAME",
+                usb: None
+            })
         );
-        assert_eq!(
-            parse_server_selector("androconnect-server-8:SAME"),
-            Some((8, "SAME"))
-        );
-        assert_eq!(
-            parse_server_selector("androconnect-server-9:[fe80::1]:5555"),
-            Some((9, "[fe80::1]:5555"))
-        );
+        assert!(parse_server_selector("androconnect-server:").is_none());
+        assert!(parse_server_selector("androconnect-server:SAME#usb:").is_none());
         assert!(parse_server_selector("androconnect-server-7:").is_none());
         assert!(parse_server_selector("androconnect-server-invalid:SAME").is_none());
+    }
+
+    #[test]
+    fn server_selector_adds_usb_path_only_for_duplicate_serials() {
+        use super::server_selector;
+        use adb_client::server::{DeviceLong, DeviceState};
+        let device = |serial: &str, usb: &str, transport_id| DeviceLong {
+            identifier: serial.to_owned(),
+            state: DeviceState::Device,
+            usb: usb.to_owned(),
+            product: "p".to_owned(),
+            model: "m".to_owned(),
+            device: "d".to_owned(),
+            transport_id,
+        };
+        let devices = [
+            device("SAME", "1-1", 7),
+            device("SAME", "1-2", 8),
+            device("ONLY", "1-3", 9),
+        ];
+        assert_eq!(
+            server_selector(&devices[0], &devices),
+            "androconnect-server:SAME#usb:1-1"
+        );
+        assert_eq!(
+            server_selector(&devices[1], &devices),
+            "androconnect-server:SAME#usb:1-2"
+        );
+        assert_eq!(
+            server_selector(&devices[2], &devices),
+            "androconnect-server:ONLY"
+        );
     }
 
     #[test]
