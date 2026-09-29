@@ -6,9 +6,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::ProtoError;
 use crate::auth::AdbKey;
 use crate::message::{Command, Packet, PacketDecoder};
-use crate::ProtoError;
 
 const AUTH_TOKEN: u32 = 1;
 const AUTH_SIGNATURE: u32 = 2;
@@ -51,7 +51,10 @@ pub struct DeviceBanner {
 impl DeviceBanner {
     /// Parses `device::ro.product.name=x;ro.product.model=y;...;features=a,b`.
     pub fn parse(banner: &str) -> Self {
-        let props = banner.trim_end_matches('\0').splitn(2, "::").nth(1).unwrap_or("");
+        let props = banner
+            .trim_end_matches('\0')
+            .split_once("::")
+            .map_or("", |(_, props)| props);
         let mut out = Self::default();
         for (key, value) in props.split(';').filter_map(|kv| kv.split_once('=')) {
             match key {
@@ -71,12 +74,19 @@ pub enum Event {
     /// The public key was offered; the user must allow it on the phone.
     AwaitingUserApproval,
     Connected(DeviceBanner),
-    StreamOpened { local_id: u32 },
+    StreamOpened {
+        local_id: u32,
+    },
     /// Call [`Session::ack`] once consumed; the device sends nothing more on
     /// this stream until then.
-    StreamData { local_id: u32, data: Vec<u8> },
+    StreamData {
+        local_id: u32,
+        data: Vec<u8>,
+    },
     /// The device closed the stream, or refused to open it.
-    StreamClosed { local_id: u32 },
+    StreamClosed {
+        local_id: u32,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -255,8 +265,12 @@ impl Session {
                     self.events.push_back(Event::AwaitingUserApproval);
                 } else {
                     let signature = self.key.sign_token(&packet.payload)?;
-                    self.transmit
-                        .push_back(Packet::new(Command::Auth, AUTH_SIGNATURE, 0, signature));
+                    self.transmit.push_back(Packet::new(
+                        Command::Auth,
+                        AUTH_SIGNATURE,
+                        0,
+                        signature,
+                    ));
                 }
                 self.send_public_key_next = !self.send_public_key_next;
                 Ok(())
@@ -394,7 +408,10 @@ mod tests {
         s.start();
         sent(&mut s);
         let token = vec![9u8; 20];
-        feed(&mut s, Packet::new(Command::Auth, AUTH_TOKEN, 0, token.clone()));
+        feed(
+            &mut s,
+            Packet::new(Command::Auth, AUTH_TOKEN, 0, token.clone()),
+        );
         let reply = sent(&mut s);
         assert_eq!(reply.len(), 1);
         assert_eq!(reply[0].arg0, AUTH_SIGNATURE);
@@ -406,14 +423,22 @@ mod tests {
 
     #[test]
     fn offers_public_key_after_rejected_signature() {
-        let mut cfg = SessionConfig::default();
-        cfg.key_comment = "andro-connect".into();
+        let cfg = SessionConfig {
+            key_comment: "andro-connect".into(),
+            ..SessionConfig::default()
+        };
         let mut s = Session::new(cfg, key());
         s.start();
         sent(&mut s);
-        feed(&mut s, Packet::new(Command::Auth, AUTH_TOKEN, 0, vec![1; 20]));
+        feed(
+            &mut s,
+            Packet::new(Command::Auth, AUTH_TOKEN, 0, vec![1; 20]),
+        );
         sent(&mut s);
-        feed(&mut s, Packet::new(Command::Auth, AUTH_TOKEN, 0, vec![2; 20]));
+        feed(
+            &mut s,
+            Packet::new(Command::Auth, AUTH_TOKEN, 0, vec![2; 20]),
+        );
         let reply = sent(&mut s);
         assert_eq!(reply[0].arg0, AUTH_RSAPUBLICKEY);
         assert_eq!(
@@ -433,7 +458,10 @@ mod tests {
             .encode_header()
             .to_vec();
         bytes.push(b'x');
-        assert!(matches!(s.handle_input(&bytes), Err(ProtoError::Protocol(_))));
+        assert!(matches!(
+            s.handle_input(&bytes),
+            Err(ProtoError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -524,8 +552,14 @@ mod tests {
         assert_eq!(
             events(&mut s),
             vec![
-                Event::StreamData { local_id: b, data: b"B".to_vec() },
-                Event::StreamData { local_id: a, data: b"A".to_vec() },
+                Event::StreamData {
+                    local_id: b,
+                    data: b"B".to_vec()
+                },
+                Event::StreamData {
+                    local_id: a,
+                    data: b"A".to_vec()
+                },
             ]
         );
     }

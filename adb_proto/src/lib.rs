@@ -6,12 +6,13 @@
 #![doc = "send, so the same protocol logic runs over blocking native USB and over"]
 #![doc = "asynchronous WebUSB in a browser."]
 
-mod error;
 pub mod auth;
+mod error;
 pub mod message;
 pub mod session;
+pub mod sync;
 
-pub use error::ProtoError;
 pub use auth::AdbKey;
+pub use error::ProtoError;
 pub use message::{Command, Packet, PacketDecoder};
 pub use session::{DeviceBanner, Event, Session, SessionConfig};

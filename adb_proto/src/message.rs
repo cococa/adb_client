@@ -59,7 +59,9 @@ pub struct Packet {
 
 /// Legacy ADB payload checksum: the byte sum of the payload.
 pub fn checksum(data: &[u8]) -> u32 {
-    data.iter().map(|&b| u32::from(b)).fold(0, u32::wrapping_add)
+    data.iter()
+        .map(|&b| u32::from(b))
+        .fold(0, u32::wrapping_add)
 }
 
 impl Packet {
@@ -228,7 +230,11 @@ mod tests {
         let bytes = wire(&packet);
         for size in [1, 7, HEADER_LEN, bytes.len()] {
             let chunks: Vec<&[u8]> = bytes.chunks(size).collect();
-            assert_eq!(decode_all(&chunks), vec![packet.clone()], "chunk size {size}");
+            assert_eq!(
+                decode_all(&chunks),
+                vec![packet.clone()],
+                "chunk size {size}"
+            );
         }
     }
 
