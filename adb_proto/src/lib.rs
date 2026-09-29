@@ -7,6 +7,7 @@
 #![doc = "asynchronous WebUSB in a browser."]
 
 mod error;
+pub mod auth;
 pub mod message;
 
 pub use error::ProtoError;
