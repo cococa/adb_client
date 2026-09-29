@@ -27,6 +27,157 @@ pub fn send_request(remote_path: &str, mode: u32) -> Vec<u8> {
     frame(b"SEND", len_u32(spec.len()), spec.as_bytes())
 }
 
+/// AOSP v1 sync requests share the same eight-byte header and UTF-8 path.
+pub fn stat_request(path: &str) -> Vec<u8> {
+    frame(b"STAT", len_u32(path.len()), path.as_bytes())
+}
+
+pub fn list_request(path: &str) -> Vec<u8> {
+    frame(b"LIST", len_u32(path.len()), path.as_bytes())
+}
+
+pub fn recv_request(path: &str) -> Vec<u8> {
+    frame(b"RECV", len_u32(path.len()), path.as_bytes())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncKind {
+    Stat,
+    List,
+    Recv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncEvent {
+    Stat {
+        mode: u32,
+        size: u32,
+        mtime: u32,
+    },
+    Dent {
+        mode: u32,
+        size: u32,
+        mtime: u32,
+        name: String,
+    },
+    Data(Vec<u8>),
+    Done,
+    Fail(String),
+}
+
+/// Incremental parser for AOSP's v1 STAT/LIST/RECV replies. Feed arbitrary
+/// transport fragments with `push`, then drain available events.
+pub struct SyncReader {
+    kind: SyncKind,
+    bytes: Vec<u8>,
+    complete: bool,
+}
+
+impl SyncReader {
+    pub fn new(kind: SyncKind) -> Self {
+        Self {
+            kind,
+            bytes: Vec::new(),
+            complete: false,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        if !self.complete {
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    pub fn next_event(&mut self) -> Result<Option<SyncEvent>, ProtoError> {
+        if self.complete || self.bytes.len() < 4 {
+            return Ok(None);
+        }
+        let id = &self.bytes[..4];
+        let (len, event, terminal) = if id == b"STAT" && self.kind == SyncKind::Stat {
+            if self.bytes.len() < 16 {
+                return Ok(None);
+            }
+            let event = SyncEvent::Stat {
+                mode: word(&self.bytes[4..8]),
+                size: word(&self.bytes[8..12]),
+                mtime: word(&self.bytes[12..16]),
+            };
+            (16, event, true)
+        } else if id == b"DENT" && self.kind == SyncKind::List {
+            if self.bytes.len() < 20 {
+                return Ok(None);
+            }
+            let name_len = word(&self.bytes[16..20]) as usize;
+            if name_len > 1024 {
+                return Err(protocol("directory entry name exceeds 1024 bytes"));
+            }
+            if self.bytes.len() < 20 + name_len {
+                return Ok(None);
+            }
+            let event = SyncEvent::Dent {
+                mode: word(&self.bytes[4..8]),
+                size: word(&self.bytes[8..12]),
+                mtime: word(&self.bytes[12..16]),
+                name: String::from_utf8_lossy(&self.bytes[20..20 + name_len]).into_owned(),
+            };
+            (20 + name_len, event, false)
+        } else if id == b"DATA" && self.kind == SyncKind::Recv {
+            if self.bytes.len() < 8 {
+                return Ok(None);
+            }
+            let size = word(&self.bytes[4..8]) as usize;
+            if size > MAX_DATA_CHUNK {
+                return Err(protocol("DATA exceeds 64 KiB"));
+            }
+            if self.bytes.len() < 8 + size {
+                return Ok(None);
+            }
+            (
+                8 + size,
+                SyncEvent::Data(self.bytes[8..8 + size].to_vec()),
+                false,
+            )
+        } else if id == b"DONE" && self.kind != SyncKind::Stat {
+            let len = if self.kind == SyncKind::List { 20 } else { 8 };
+            if self.bytes.len() < len {
+                return Ok(None);
+            }
+            (len, SyncEvent::Done, true)
+        } else if id == b"FAIL" {
+            if self.bytes.len() < 8 {
+                return Ok(None);
+            }
+            let size = word(&self.bytes[4..8]) as usize;
+            if size > 4096 {
+                return Err(protocol("FAIL message exceeds 4096 bytes"));
+            }
+            if self.bytes.len() < 8 + size {
+                return Ok(None);
+            }
+            let text = String::from_utf8_lossy(&self.bytes[8..8 + size]).into_owned();
+            (8 + size, SyncEvent::Fail(text), true)
+        } else {
+            return Err(protocol(format!(
+                "unexpected sync reply {:?}",
+                String::from_utf8_lossy(id)
+            )));
+        };
+        self.bytes.drain(..len);
+        if terminal {
+            self.complete = true;
+        }
+        Ok(Some(event))
+    }
+}
+
+fn word(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("four bytes"))
+}
+
+fn protocol(message: impl Into<String>) -> ProtoError {
+    ProtoError::Protocol(message.into())
+}
+
 /// `DATA` frames of at most [`MAX_DATA_CHUNK`] bytes each.
 pub fn data_frames(bytes: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
     bytes
@@ -110,5 +261,99 @@ mod tests {
             Err(ProtoError::Protocol("file transfer failed: denied".into()))
         );
         assert!(parse_status(b"WHAT\0\0\0\0").is_err());
+    }
+
+    #[test]
+    fn read_request_layouts_follow_aosp_sync_request() {
+        // AOSP file_sync_protocol.h: four ASCII ID bytes, LE path byte count,
+        // then UTF-8 path bytes without a trailing NUL.
+        assert_eq!(stat_request("/sdcard/é"), b"STAT\x0a\0\0\0/sdcard/\xc3\xa9");
+        assert_eq!(list_request("/sdcard"), b"LIST\x07\0\0\0/sdcard");
+        assert_eq!(recv_request("/a"), b"RECV\x02\0\0\0/a");
+    }
+
+    #[test]
+    fn reads_stat_and_multiple_directory_entries_by_single_bytes() {
+        // AOSP sync_stat_v1 is 16 bytes, sync_dent_v1 is 20 plus namelen.
+        let stat = b"STAT\xa4\x81\0\0\x03\0\0\0\x04\0\0\0";
+        let mut reader = SyncReader::new(SyncKind::Stat);
+        for byte in stat.iter().take(stat.len() - 1) {
+            reader.push(&[*byte]);
+            assert_eq!(reader.next_event().unwrap(), None);
+        }
+        reader.push(&stat[stat.len() - 1..]);
+        assert_eq!(
+            reader.next_event().unwrap(),
+            Some(SyncEvent::Stat {
+                mode: 0o100644,
+                size: 3,
+                mtime: 4
+            })
+        );
+
+        let list = b"DENT\xed\x41\0\0\0\0\0\0\x04\0\0\0\x03\0\0\0dir\
+                     DENT\xa4\x81\0\0\x05\0\0\0\x06\0\0\0\x01\0\0\0x\
+                     DONE\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let mut reader = SyncReader::new(SyncKind::List);
+        let mut events = Vec::new();
+        for byte in list {
+            reader.push(&[*byte]);
+            while let Some(event) = reader.next_event().unwrap() {
+                events.push(event);
+            }
+        }
+        assert_eq!(
+            events,
+            vec![
+                SyncEvent::Dent {
+                    mode: 0o40755,
+                    size: 0,
+                    mtime: 4,
+                    name: "dir".into()
+                },
+                SyncEvent::Dent {
+                    mode: 0o100644,
+                    size: 5,
+                    mtime: 6,
+                    name: "x".into()
+                },
+                SyncEvent::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_data_done_and_fail_incrementally() {
+        let mut reader = SyncReader::new(SyncKind::Recv);
+        reader.push(b"DATA\x03\0\0\0abcDATA\x02\0\0\0deDONE\0\0\0\0");
+        assert_eq!(
+            reader.next_event().unwrap(),
+            Some(SyncEvent::Data(b"abc".to_vec()))
+        );
+        assert_eq!(
+            reader.next_event().unwrap(),
+            Some(SyncEvent::Data(b"de".to_vec()))
+        );
+        assert_eq!(reader.next_event().unwrap(), Some(SyncEvent::Done));
+        assert_eq!(reader.next_event().unwrap(), None);
+
+        let mut reader = SyncReader::new(SyncKind::Recv);
+        reader.push(b"FAIL\x06\0\0\0den");
+        assert_eq!(reader.next_event().unwrap(), None);
+        reader.push(b"ied");
+        assert_eq!(
+            reader.next_event().unwrap(),
+            Some(SyncEvent::Fail("denied".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_oversize_data_and_wrong_reply() {
+        let mut reader = SyncReader::new(SyncKind::Recv);
+        reader.push(b"DATA\x01\0\x01\0");
+        assert!(reader.next_event().is_err());
+        let mut reader = SyncReader::new(SyncKind::List);
+        reader.push(b"DATA\0\0\0\0");
+        assert!(reader.next_event().is_err());
     }
 }
