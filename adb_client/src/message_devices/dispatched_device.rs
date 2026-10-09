@@ -413,6 +413,7 @@ impl DispatchedADBMessageDevice {
     }
 
     pub(crate) fn pull(&self, path: &str, output: &mut dyn Write) -> Result<()> {
+        let _transfer = self.dispatcher.begin_bulk_transfer();
         let service = self.open_session(&ADBLocalCommand::Sync)?;
         let mut request = b"RECV".to_vec();
         request.extend_from_slice(&u32::try_from(path.len())?.to_le_bytes());
@@ -472,6 +473,7 @@ impl DispatchedADBMessageDevice {
     /// USB interface is never reopened while scrcpy is starting.
     pub(crate) fn push<R: Read>(&self, mut input: R, path: &str) -> Result<()> {
         const CHUNK_SIZE: usize = 65_535;
+        let _transfer = self.dispatcher.begin_bulk_transfer();
         let service = self.open_session(&ADBLocalCommand::Sync)?;
         let destination = format!("{path},0777");
         let mut begin = MessageSubcommand::Send

@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -30,6 +30,30 @@ use crate::{
 // latency below one display frame while avoiding 1,000 idle IOKit reads per
 // second for every connected device.
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(8);
+
+// A file transfer is one write per chunk followed by the phone's
+// acknowledgement, and a write queued while the loop is inside a read waits
+// for that read to time out. At 8 ms per 64 KiB chunk that is under 8 MiB/s,
+// so poll faster, but only while a transfer is running.
+const BULK_READ_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+const fn read_poll_interval(bulk_transfer_active: bool) -> Duration {
+    if bulk_transfer_active {
+        BULK_READ_POLL_INTERVAL
+    } else {
+        READ_POLL_INTERVAL
+    }
+}
+
+/// Keeps the dispatcher on the short read poll until dropped.
+#[derive(Debug)]
+pub(crate) struct BulkTransfer(Arc<AtomicUsize>);
+
+impl Drop for BulkTransfer {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug)]
 enum DispatcherCommand {
@@ -114,6 +138,7 @@ impl Drop for DispatchedSession {
 #[derive(Debug)]
 pub(crate) struct TransportDispatcher {
     alive: Arc<AtomicBool>,
+    bulk_transfers: Arc<AtomicUsize>,
     command_tx: Sender<DispatcherCommand>,
     incoming_open_rx: Mutex<Receiver<ADBTransportMessage>>,
 }
@@ -124,13 +149,22 @@ impl TransportDispatcher {
         let (incoming_open_tx, incoming_open_rx) = mpsc::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let running = Arc::clone(&alive);
+        let bulk_transfers = Arc::new(AtomicUsize::new(0));
+        let active_bulk_transfers = Arc::clone(&bulk_transfers);
         let relay_tx = command_tx.clone();
         thread::spawn(move || {
-            run_loop(&mut transport, command_rx, incoming_open_tx, relay_tx);
+            run_loop(
+                &mut transport,
+                command_rx,
+                incoming_open_tx,
+                relay_tx,
+                &active_bulk_transfers,
+            );
             running.store(false, Ordering::Release);
         });
         Self {
             alive,
+            bulk_transfers,
             command_tx,
             incoming_open_rx: Mutex::new(incoming_open_rx),
         }
@@ -159,6 +193,12 @@ impl TransportDispatcher {
 
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Marks a file transfer as running for the lifetime of the returned guard.
+    pub(crate) fn begin_bulk_transfer(&self) -> BulkTransfer {
+        self.bulk_transfers.fetch_add(1, Ordering::AcqRel);
+        BulkTransfer(Arc::clone(&self.bulk_transfers))
     }
 
     pub(crate) fn set_route(&self, remote: String, local: Option<String>) -> Result<()> {
@@ -223,6 +263,7 @@ fn run_loop<T: ADBMessageTransport>(
     command_rx: Receiver<DispatcherCommand>,
     incoming_open_tx: Sender<ADBTransportMessage>,
     command_tx: Sender<DispatcherCommand>,
+    bulk_transfers: &AtomicUsize,
 ) {
     let mut routes: HashMap<String, String> = HashMap::new();
     let mut sessions: HashMap<u32, Sender<ADBTransportMessage>> = HashMap::new();
@@ -280,7 +321,8 @@ fn run_loop<T: ADBMessageTransport>(
             }
         }
 
-        match transport.read_message_with_timeout(READ_POLL_INTERVAL) {
+        let poll_interval = read_poll_interval(bulk_transfers.load(Ordering::Acquire) > 0);
+        match transport.read_message_with_timeout(poll_interval) {
             Ok(packet) => match packet.header().command() {
                 MessageCommand::Open => {
                     // adbd OPEN names the host destination (tcp:port), not
@@ -426,6 +468,70 @@ mod tests {
             self.written.send(message).unwrap();
             Ok(())
         }
+    }
+
+    #[test]
+    fn read_poll_is_short_only_during_bulk_transfers() {
+        let (_input_tx, input_rx) = mpsc::channel();
+        let (written, _output) = mpsc::channel();
+        let dispatcher = TransportDispatcher::start(TestTransport {
+            incoming: Arc::new(Mutex::new(input_rx)),
+            written,
+        });
+        let active = || dispatcher.bulk_transfers.load(Ordering::Acquire) > 0;
+        assert_eq!(read_poll_interval(active()), READ_POLL_INTERVAL);
+        let upload = dispatcher.begin_bulk_transfer();
+        let download = dispatcher.begin_bulk_transfer();
+        assert_eq!(read_poll_interval(active()), BULK_READ_POLL_INTERVAL);
+        drop(upload);
+        assert_eq!(read_poll_interval(active()), BULK_READ_POLL_INTERVAL);
+        drop(download);
+        assert_eq!(read_poll_interval(active()), READ_POLL_INTERVAL);
+        dispatcher.shutdown();
+    }
+
+    /// Mirrors a file transfer: every write is answered at once, and the
+    /// answer is routed back before the next write is queued.
+    #[test]
+    fn bulk_transfer_round_trips_do_not_wait_for_the_idle_poll() {
+        const ROUND_TRIPS: u32 = 100;
+        let (input_tx, input_rx) = mpsc::channel();
+        let (written, output) = mpsc::channel::<ADBTransportMessage>();
+        let dispatcher = TransportDispatcher::start(TestTransport {
+            incoming: Arc::new(Mutex::new(input_rx)),
+            written,
+        });
+        let session = dispatcher.register().unwrap();
+        let local_id = session.local_id();
+        thread::spawn(move || {
+            while output.recv().is_ok() {
+                let okay = ADBTransportMessage::try_new(MessageCommand::Okay, 900, local_id, &[]);
+                if input_tx.send(okay.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let round_trips = || {
+            let started = std::time::Instant::now();
+            for _ in 0..ROUND_TRIPS {
+                let chunk =
+                    ADBTransportMessage::try_new(MessageCommand::Write, local_id, 900, b"x");
+                session.send(chunk.unwrap()).unwrap();
+                session.receive().unwrap();
+            }
+            started.elapsed()
+        };
+        let idle = round_trips();
+        let bulk = {
+            let _transfer = dispatcher.begin_bulk_transfer();
+            round_trips()
+        };
+        // Idle polling costs up to 8 ms per round trip, the transfer poll 1 ms.
+        assert!(
+            bulk * 2 < idle,
+            "bulk {bulk:?} was not faster than idle {idle:?}"
+        );
+        dispatcher.shutdown();
     }
 
     #[test]

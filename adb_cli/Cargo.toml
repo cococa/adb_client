@@ -21,6 +21,7 @@ log = { version = "0.4.32" }
 tabwriter = { version = "1.4.1" }
 
 [target.'cfg(unix)'.dependencies]
+libc = { version = "0.2" }
 termios = { version = "0.3.3" }
 
 #####################################
