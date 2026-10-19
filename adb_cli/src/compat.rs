@@ -136,6 +136,16 @@ fn server_selector(device: &DeviceLong, devices: &[DeviceLong]) -> String {
     }
 }
 
+/// The transport ID a server reported for `device`, or `None` when the server
+/// is too old to report one (its rows carry no `transport_id`, which parses as
+/// 0). Such a server also does not understand `host:transport-id:`, and treats
+/// the request as "any device": it then fails with "more than one
+/// device/emulator" as soon as a second transport, such as the same phone's
+/// offline wireless entry, is listed. Those devices are selected by serial.
+fn server_transport_id(device: &DeviceLong) -> Option<u64> {
+    (device.transport_id != 0).then_some(u64::from(device.transport_id))
+}
+
 fn server_usb_path(device: &DeviceLong) -> Option<&str> {
     let usb = device.usb.as_str();
     (!usb.is_empty() && usb != "Unk" && !usb.contains(':')).then_some(usb)
@@ -1795,7 +1805,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let transport_id = if named_server_transport {
                 matching_server_devices
                     .first()
-                    .map(|device| u64::from(device.transport_id))
+                    .and_then(|device| server_transport_id(device))
             } else {
                 selected_transport_id
             };
@@ -2111,6 +2121,20 @@ mod tests {
         parse_forward_request, push_compatible, update_wireless_endpoints, wireless_endpoints,
         wireless_endpoints_path,
     };
+
+    #[test]
+    fn server_without_transport_ids_selects_by_serial() {
+        let legacy = adb_client::server::DeviceLong::try_from(
+            b"6DRG49AI8DRC55FU       device usb:17825792X product:pond model:2409BRN2CC device:pond".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(super::server_transport_id(&legacy), None);
+        let current = adb_client::server::DeviceLong::try_from(
+            b"6DRG49AI8DRC55FU device usb:17825792X product:pond model:2409BRN2CC device:pond transport_id:7".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(super::server_transport_id(&current), Some(7));
+    }
 
     #[test]
     fn offline_server_wireless_does_not_own_direct_commands() {
