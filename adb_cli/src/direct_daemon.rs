@@ -102,7 +102,7 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
     if socket.exists() {
         fs::remove_file(&socket)?;
     }
-    Command::new(std::env::current_exe()?)
+    let mut child = Command::new(std::env::current_exe()?)
         .env("ADB_CLI_DIRECT_DAEMON", "1")
         .env("ANDROCONNECT_ADB_KEY", &context.key)
         .env("ADB_CLI_VENDOR", context.vendor.to_string())
@@ -123,11 +123,21 @@ pub(crate) fn ensure_running(context: &Context) -> Result<(), Box<dyn std::error
         if daemon_is_healthy(&socket) {
             return Ok(());
         }
+        // A daemon that already exited has written its reason to the log;
+        // report it now instead of after the full wait.
+        if child.try_wait()?.is_some() {
+            break;
+        }
         thread::sleep(Duration::from_millis(25));
     }
+    let log = fs::read_to_string(socket.with_extension("log")).unwrap_or_default();
     Err(format!(
         "direct USB daemon did not become ready: {}",
-        fs::read_to_string(socket.with_extension("log")).unwrap_or_default()
+        if log.trim().is_empty() {
+            "still opening the USB interface (no error reported yet)"
+        } else {
+            log.trim()
+        }
     )
     .into())
 }

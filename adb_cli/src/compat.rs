@@ -202,6 +202,9 @@ fn usb_listing(device: &ADBDeviceInfo, details: Result<String, String>) -> Strin
             let state = if lower.contains("unauthorized") || lower.contains("authorization") {
                 "unauthorized"
             } else if lower.contains("0xe00002c5")
+                // kIOReturnNoResources on open: another client (adb server,
+                // hdc) already holds the ADB interface.
+                || lower.contains("0xe00002be")
                 || lower.contains("exclusive access")
                 || lower.contains("resource busy")
             {
@@ -353,6 +356,12 @@ fn probe_wireless_transports(
     key: &Path,
 ) -> Vec<(SocketAddr, Result<String, String>)> {
     bounded_parallel_map(addresses, MAX_CONCURRENT_WIRELESS_PROBES, |address| {
+        // Saved endpoints are often stale (Wi-Fi debugging off, phone away).
+        // A short reachability check avoids the transport's 3 s connect wait
+        // on every scan; a live phone on the LAN answers well within it.
+        if TcpStream::connect_timeout(address, Duration::from_millis(500)).is_err() {
+            return (*address, Err(format!("{address} is not reachable")));
+        }
         (
             *address,
             connect_wireless(*address, key).map_err(|error| error.to_string()),
@@ -691,6 +700,12 @@ fn existing_server_devices()
             Err(format!("existing ADB server at {address} is unavailable: {error}").into())
         }
     }
+}
+
+// A legacy server may leave an offline row for a TLS endpoint that the App
+// has connected directly. Only a ready server transport owns wireless commands.
+fn unavailable_server_wireless(device: &DeviceLong) -> bool {
+    device.state != DeviceState::Device && device.identifier.parse::<SocketAddr>().is_ok()
 }
 
 fn connect_via_existing_server(address: SocketAddr) -> bool {
@@ -1681,10 +1696,31 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             return Err("usage: adb devices [-l]".into());
         }
         println!("List of devices attached");
-        let mut identifiers = BTreeSet::new();
+        let ready_server_identifiers: BTreeSet<_> = server
+            .iter()
+            .flat_map(|(_, devices)| devices)
+            .filter(|device| device.state == DeviceState::Device)
+            .map(|device| device.identifier.as_str())
+            .collect();
+        let wireless_addresses: Vec<_> = wireless_endpoints(&key)?
+            .into_iter()
+            .filter(|address| !ready_server_identifiers.contains(address.to_string().as_str()))
+            .collect();
+        let wireless_results = probe_wireless_transports(&wireless_addresses, &key);
+        let ready_direct_identifiers: BTreeSet<_> = wireless_results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(address, _)| address.to_string())
+            .collect();
+        let mut listed_identifiers = BTreeSet::new();
         if let Some((_, server_devices)) = &server {
             for device in server_devices {
-                identifiers.insert(device.identifier.clone());
+                if unavailable_server_wireless(device)
+                    && ready_direct_identifiers.contains(&device.identifier)
+                {
+                    continue;
+                }
+                listed_identifiers.insert(device.identifier.clone());
                 println!(
                     "{}\t{} model:{} transport_id:{} androconnect_transport:server androconnect_serial:{}",
                     server_selector(device, server_devices),
@@ -1703,13 +1739,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         for row in list_usb_transports(&key, existing_only) {
             println!("{row}");
         }
-        // Preserve adb_client-managed wireless endpoints that are not also
-        // registered in the developer-owned ADB server.
-        let wireless_addresses: Vec<_> = wireless_endpoints(&key)?
-            .into_iter()
-            .filter(|address| !identifiers.contains(&address.to_string()))
-            .collect();
-        for (address, result) in probe_wireless_transports(&wireless_addresses, &key) {
+        for (address, result) in wireless_results {
+            // If both probes failed, keep the server's status row only.
+            if listed_identifiers.contains(&address.to_string()) {
+                continue;
+            }
             match result {
                 Ok(serial) => println!(
                     "{address}\tdevice product:wireless model:{serial} transport_id:{}",
@@ -1734,12 +1768,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some((address, server_devices)) = &server {
+        let selects_wireless_address = !named_server_transport
+            && serial
+                .as_deref()
+                .is_some_and(|value| value.parse::<SocketAddr>().is_ok());
         let matching_server_devices: Vec<_> = server_devices
             .iter()
             .filter(|device| {
                 serial
                     .as_ref()
                     .is_none_or(|serial| &device.identifier == serial)
+                    && (!selects_wireless_address || !unavailable_server_wireless(device))
                     && selected_transport_id.is_none_or(|id| u64::from(device.transport_id) == id)
                     && server_usb
                         .as_deref()
@@ -2074,6 +2113,31 @@ mod tests {
     };
 
     #[test]
+    fn offline_server_wireless_does_not_own_direct_commands() {
+        let device = adb_client::server::DeviceLong::try_from(
+            b"192.168.10.61:40889    offline".as_slice(),
+        )
+        .unwrap();
+        assert!(super::unavailable_server_wireless(&device));
+    }
+
+    #[test]
+    fn ready_server_wireless_keeps_its_route() {
+        let device = adb_client::server::DeviceLong::try_from(
+            b"192.168.10.61:40889 device product:phone model:Phone device:phone transport_id:3".as_slice(),
+        )
+        .unwrap();
+        assert!(!super::unavailable_server_wireless(&device));
+    }
+
+    #[test]
+    fn offline_usb_keeps_server_diagnostics() {
+        let device =
+            adb_client::server::DeviceLong::try_from(b"USBPHONE offline".as_slice()).unwrap();
+        assert!(!super::unavailable_server_wireless(&device));
+    }
+
+    #[test]
     fn bounded_parallel_map_limits_workers_and_preserves_order() {
         let items: Vec<_> = (0..12).collect();
         let active = std::sync::atomic::AtomicUsize::new(0);
@@ -2320,6 +2384,7 @@ mod tests {
         assert!(parse_usb_selector("usb-18d1:4ee7@0").is_none());
         assert!(usb_listing(&first, Err("unauthorized".into())).contains("\tunauthorized "));
         assert!(usb_listing(&second, Err("0xe00002c5".into())).contains("\tusb_busy "));
+        assert!(usb_listing(&second, Err("open failed (0xe00002be)".into())).contains("\tusb_busy "));
 
         // Same model, port and reported serial, but a different attachment.
         let replacement = adb_client::usb::ADBDeviceInfo {

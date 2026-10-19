@@ -7,7 +7,7 @@ use crate::server::DeviceState;
 use regex::bytes::Regex;
 
 static DEVICES_LONG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<identifier>\S+)\s+(?P<state>\w+)\s+(usb:(?P<usb1>\S+)|(?P<usb2>\S+))?\s*(product:(?P<product>.*)\s+model:(?P<model>.*)\s+device:(?P<device>\S+))?\s*(transport_id:(?P<transport_id>\d+))?$").expect("cannot build devices long regex")
+    Regex::new(r"^(?P<identifier>\S+)\s+(?P<state>\w+)\s*(usb:(?P<usb1>\S+)|(?P<usb2>\S+))?\s*(product:(?P<product>.*)\s+model:(?P<model>.*)\s+device:(?P<device>\S+))?\s*(transport_id:(?P<transport_id>\d+))?$").expect("cannot build devices long regex")
 });
 
 /// Represents a new device with more informations.
@@ -195,6 +195,22 @@ mod tests {
                 "parsed device does not match expected"
             );
         }
+    }
+
+    #[test]
+    fn state_only_legacy_offline_row_is_valid() {
+        // Actual reply from a 1.0.36 server; no space or metadata after state.
+        let row = b"192.168.10.61:40889    offline";
+        let device = DeviceLong::try_from(row.as_slice()).unwrap();
+        assert_eq!(device.state, DeviceState::Offline);
+        assert_eq!(device.identifier, "192.168.10.61:40889");
+        assert_eq!(device.transport_id, 0);
+    }
+
+    #[test]
+    fn state_only_unauthorized_row_is_valid() {
+        let device = DeviceLong::try_from(b"PHONE\tunauthorized".as_slice()).unwrap();
+        assert_eq!(device.state, DeviceState::Unauthorized);
     }
 
     #[test]
