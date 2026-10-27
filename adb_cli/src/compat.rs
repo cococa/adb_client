@@ -25,6 +25,10 @@ use std::{
 };
 
 const MAX_CONCURRENT_WIRELESS_PROBES: usize = 3;
+/// How long a saved wireless address that failed its reachability check is
+/// skipped. Without this every `devices` call (scrcpy runs one on each start)
+/// waits out the 500 ms connect timeout for each stale saved phone.
+const UNREACHABLE_WIRELESS_TTL_MS: u128 = 30_000;
 const DIRECT_ADB_FEATURES: &str = "";
 
 fn bounded_parallel_map<T, U, F>(items: &[T], limit: usize, operation: F) -> Vec<U>
@@ -349,7 +353,71 @@ fn update_wireless_endpoints<T>(
     Ok(output)
 }
 
+fn unreachable_wireless_path(key: &Path) -> PathBuf {
+    key.with_file_name("wireless-unreachable")
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+/// Addresses that failed the reachability check less than the TTL ago.
+/// Best effort: a missing or damaged file just means everything is probed.
+fn read_unreachable_wireless(path: &Path, now: u128) -> Vec<(SocketAddr, u128)> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let (address, stamp) = line.split_once('\t')?;
+            let stamp: u128 = stamp.parse().ok()?;
+            (now.saturating_sub(stamp) < UNREACHABLE_WIRELESS_TTL_MS)
+                .then(|| Some((address.parse().ok()?, stamp)))?
+        })
+        .collect()
+}
+
+fn write_unreachable_wireless(path: &Path, entries: &[(SocketAddr, u128)]) {
+    let temporary = path.with_file_name(format!(".wireless-unreachable.{}.tmp", std::process::id()));
+    let body: String = entries
+        .iter()
+        .map(|(address, stamp)| format!("{address}\t{stamp}\n"))
+        .collect();
+    if fs::write(&temporary, body).is_ok() && fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+}
+
+fn record_unreachable_wireless(key: &Path, addresses: &[SocketAddr]) {
+    if addresses.is_empty() {
+        return;
+    }
+    let path = unreachable_wireless_path(key);
+    let now = now_millis();
+    let mut entries = read_unreachable_wireless(&path, now);
+    entries.retain(|(address, _)| !addresses.contains(address));
+    entries.extend(addresses.iter().map(|address| (*address, now)));
+    write_unreachable_wireless(&path, &entries);
+}
+
+fn clear_unreachable_wireless(key: &Path, address: SocketAddr) {
+    let path = unreachable_wireless_path(key);
+    let entries = read_unreachable_wireless(&path, now_millis());
+    if entries.iter().any(|(candidate, _)| *candidate == address) {
+        let remaining: Vec<_> = entries
+            .into_iter()
+            .filter(|(candidate, _)| *candidate != address)
+            .collect();
+        write_unreachable_wireless(&path, &remaining);
+    }
+}
+
 fn connect_wireless(address: SocketAddr, key: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    clear_unreachable_wireless(key, address);
     let mut device = ADBTcpDevice::new_with_custom_private_key(address, key)?;
     let mut serial = Vec::new();
     device.shell_command(&"getprop ro.serialno", Some(&mut serial), None)?;
@@ -365,18 +433,38 @@ fn probe_wireless_transports(
     addresses: &[SocketAddr],
     key: &Path,
 ) -> Vec<(SocketAddr, Result<String, String>)> {
-    bounded_parallel_map(addresses, MAX_CONCURRENT_WIRELESS_PROBES, |address| {
+    let recently_unreachable: Vec<SocketAddr> =
+        read_unreachable_wireless(&unreachable_wireless_path(key), now_millis())
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect();
+    let results = bounded_parallel_map(addresses, MAX_CONCURRENT_WIRELESS_PROBES, |address| {
         // Saved endpoints are often stale (Wi-Fi debugging off, phone away).
-        // A short reachability check avoids the transport's 3 s connect wait
-        // on every scan; a live phone on the LAN answers well within it.
+        // One that just failed is skipped; otherwise a short reachability
+        // check avoids the transport's 3 s connect wait on every scan, and a
+        // live phone on the LAN answers well within it.
+        if recently_unreachable.contains(address) {
+            return (*address, Err(format!("{address} is not reachable")), false);
+        }
         if TcpStream::connect_timeout(address, Duration::from_millis(500)).is_err() {
-            return (*address, Err(format!("{address} is not reachable")));
+            return (*address, Err(format!("{address} is not reachable")), true);
         }
         (
             *address,
             connect_wireless(*address, key).map_err(|error| error.to_string()),
+            false,
         )
-    })
+    });
+    let newly_unreachable: Vec<SocketAddr> = results
+        .iter()
+        .filter(|(_, _, timed_out)| *timed_out)
+        .map(|(address, _, _)| *address)
+        .collect();
+    record_unreachable_wireless(key, &newly_unreachable);
+    results
+        .into_iter()
+        .map(|(address, result, _)| (address, result))
+        .collect()
 }
 
 struct InstallRequest {
@@ -2121,6 +2209,27 @@ mod tests {
         parse_forward_request, push_compatible, update_wireless_endpoints, wireless_endpoints,
         wireless_endpoints_path,
     };
+
+    #[test]
+    fn unreachable_wireless_entries_expire_and_clear() {
+        let directory = std::env::temp_dir().join(format!("adb-unreachable-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let key = directory.join("adbkey");
+        let first: std::net::SocketAddr = "192.168.10.82:33473".parse().unwrap();
+        let second: std::net::SocketAddr = "192.168.10.83:40000".parse().unwrap();
+        super::record_unreachable_wireless(&key, &[first, second]);
+        let path = super::unreachable_wireless_path(&key);
+        let now = super::now_millis();
+        let fresh = super::read_unreachable_wireless(&path, now);
+        assert_eq!(fresh.len(), 2);
+        // Past the TTL both entries are ignored.
+        let later = now + super::UNREACHABLE_WIRELESS_TTL_MS + 1;
+        assert!(super::read_unreachable_wireless(&path, later).is_empty());
+        super::clear_unreachable_wireless(&key, first);
+        let remaining = super::read_unreachable_wireless(&path, super::now_millis());
+        assert_eq!(remaining.iter().map(|(a, _)| *a).collect::<Vec<_>>(), vec![second]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn server_without_transport_ids_selects_by_serial() {
